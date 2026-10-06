@@ -9,8 +9,8 @@ import numpy as np
 from PIL import Image
 from flask import Flask
 from prototype_common import sha256,perceptual_hash
-from palm_keypoints import LINES,SCHEMA
-from palm_keypoints.data import empty_annotation,write_json,annotation_path,validate_annotation,audited_rows,export_yolo,create_from_review,read_json,limit_review_queue
+from palm_keypoints import LINES,SCHEMA,TOTAL_POINTS,COORDS,LINE_POINTS,LEGACY_SCHEMA
+from palm_keypoints.data import empty_annotation,write_json,annotation_path,validate_annotation,audited_rows,export_yolo,create_from_review,read_json,limit_review_queue,migrate_project
 from palm_keypoints.spline import trace_line,width_from_points
 from palm_keypoints.model import PoseCNN,prepare_image,to_model,from_model,targets
 from palm_keypoints.workflow import train,infer,pseudo
@@ -55,10 +55,19 @@ class SplineTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_partial_annotation_masks_unknown_coordinates_and_presence(self):
+        a=empty_annotation('0'*20);a['handedness']='left'
+        a['lines']['heart_line']={'status':'unreviewed','points':[[.2,.3],[.4,.3]]}
+        _,meta=prepare_image(np.zeros((64,64,3),np.uint8));y,m=targets(a,meta)
+        self.assertEqual(len(y),44);self.assertEqual(m[:-1].sum(),0);self.assertEqual(m[-1],1)
+        self.assertEqual(y[-1],0)
+        a['lines']['head_line']={'status':'absent','points':[]};_,m=targets(a,meta)
+        self.assertEqual(m[COORDS+1],1);self.assertEqual(m[COORDS],0)
+
     def test_unknown_side_is_not_a_training_label(self):
         a=annotation('0'*20);a.update(handedness='unknown',mirrored='unknown')
         x,meta=prepare_image(np.zeros((64,64,3),np.uint8));y,m=targets(a,meta)
-        self.assertEqual(m[-1],0);self.assertTrue(np.all(m[52:56]==1))
+        self.assertEqual(m[-1],0);self.assertTrue(np.all(m[COORDS:COORDS+len(LINES)]==1))
         model=PoseCNN();loss,grad=model.loss_grad(x[None],y[None],m[None],dropout=0)
         changed=y.copy();changed[-1]=1-y[-1]
         other,other_grad=model.loss_grad(x[None],changed[None],m[None],dropout=0)
@@ -69,7 +78,7 @@ class ModelTests(unittest.TestCase):
         _,meta=prepare_image(np.zeros((120,300,3),np.uint8));p=np.array([[0,0],[1,1],[.2,.7]])
         np.testing.assert_allclose(from_model(to_model(p,meta),meta),p,atol=1e-7)
     def test_gradients_and_learning(self):
-        model=PoseCNN(2);x=np.random.default_rng(5).normal(0,.3,(2,64,64,3)).astype(np.float32);y=np.full((2,57),.7,np.float32);mask=np.ones_like(y)
+        model=PoseCNN(2);x=np.random.default_rng(5).normal(0,.3,(2,64,64,3)).astype(np.float32);y=np.full((2,COORDS+len(LINES)+1),.7,np.float32);mask=np.ones_like(y)
         first,grads=model.loss_grad(x,y,mask,dropout=0)
         for key in ('w1','w2','w3','w4','b4'):
             index=np.unravel_index(np.argmax(np.abs(grads[key])),grads[key].shape);value=model.p[key][index];eps=.002
@@ -78,8 +87,8 @@ class ModelTests(unittest.TestCase):
         for _ in range(25):loss,g=model.loss_grad(x,y,mask,dropout=0);model.update(g)
         self.assertLess(loss,first*.55)
     def test_absence_mask_mirror_and_checkpoint(self):
-        a=annotation('0'*20);a['lines']['fate_line']={'status':'absent','points':[]};a['mirrored']='yes'
-        x,meta=prepare_image(np.zeros((64,64,3),np.uint8));y,m=targets(a,meta);self.assertEqual(m[36:48].sum(),0);self.assertEqual(y[-1],0)
+        a=annotation('0'*20);a['lines']['life_line']={'status':'absent','points':[]};a['mirrored']='yes'
+        x,meta=prepare_image(np.zeros((64,64,3),np.uint8));y,m=targets(a,meta);self.assertEqual(m[24:36].sum(),0);self.assertEqual(y[-1],1)
         with tempfile.TemporaryDirectory() as t:
             path=Path(t)/'m.npz';model=PoseCNN();model.save(path,{})
             loaded=PoseCNN.load(path,sha256(path));np.testing.assert_array_equal(model.predict_tensor(x[None]),loaded.predict_tensor(x[None]))
@@ -88,6 +97,31 @@ class ModelTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+    def test_v1_migration_keeps_original_fourth_line_and_backup(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);rows=fixture(root,3);doc=read_json(root/'project.json');doc['schema']=LEGACY_SCHEMA;write_json(root/'project.json',doc)
+            for row in rows:
+                path=annotation_path(root,row['image_id']);a=read_json(path);a['schema']=LEGACY_SCHEMA;a['lines']['fate_line']={'status':'unreviewed','points':[[.4,.4]]};write_json(path,a)
+            result=migrate_project(root);self.assertEqual(result['changed'],3)
+            migrated=read_json(annotation_path(root,rows[0]['image_id']))
+            self.assertEqual(migrated['schema'],SCHEMA);self.assertEqual(set(migrated['lines']),set(LINES))
+            self.assertEqual(migrated['legacy_lines']['fate_line']['points'],[[.4,.4]])
+            backup=read_json(Path(result['backup'])/'annotations'/(rows[0]['image_id']+'.json'))
+            self.assertEqual(backup['schema'],LEGACY_SCHEMA);self.assertIn('fate_line',backup['lines'])
+            self.assertEqual(migrate_project(root)['changed'],0)
+
+    def test_approved_partial_annotation_keeps_blanks_and_exports_fixed_shape(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);rows=fixture(root,6)
+            for row in rows:
+                a=empty_annotation(row['image_id']);a.update(status='approved',handedness='left',subject_id=row['image_id'])
+                a['lines']['heart_line']['points']=[[.1,.2]]
+                self.assertEqual(validate_annotation(a,(64,64))['lines']['heart_line']['status'],'unreviewed')
+                write_json(annotation_path(root,row['image_id']),a)
+            out=root/'export';export_yolo(root,out)
+            values=next((out/'labels').rglob('*.txt')).read_text().split()
+            self.assertEqual(len(values),65);self.assertTrue(all(float(v)==0 for v in values[5:]))
+
     def test_approval_without_optional_hand_metadata(self):
         a=annotation('0'*20);a.update(handedness='unknown',mirrored='unknown')
         self.assertEqual(validate_annotation(a,(500,500))['status'],'approved')
@@ -115,7 +149,7 @@ class DataTests(unittest.TestCase):
             self.assertEqual(before,sha256(root/'project.json'))
 
     def test_schema_and_approval_contract(self):
-        a=annotation('0'*20);validate_annotation(a,(500,500));a['lines']['simian_line']=a['lines'].pop('fate_line')
+        a=annotation('0'*20);validate_annotation(a,(500,500));a['lines']['simian_line']=a['lines'].pop('life_line')
         with self.assertRaises(ValueError):validate_annotation(a,(500,500))
         for change in ('missing','absent_points','bad_type'):
             a=annotation('0'*20)
@@ -129,8 +163,8 @@ class DataTests(unittest.TestCase):
             self.assertEqual({r['split'] for r in rows},{'train','val','test'})
             self.assertTrue(all(r['source_group'].startswith('subject:') for r in rows))
             out=Path(t)/'export';r=export_yolo(root,out);self.assertEqual(r['count'],12)
-            self.assertEqual(len(next((out/'labels').rglob('*.txt')).read_text().split()),83)
-            self.assertIn('fate_line', (out/'schema.json').read_text())
+            self.assertEqual(len(next((out/'labels').rglob('*.txt')).read_text().split()),65)
+            self.assertNotIn('fate_line', (out/'schema.json').read_text())
             self.assertTrue(all((out/r['image_path']).is_file() for r in read_json(out/'annotations.json')['images']))
     def test_legacy_review_manifest_join(self):
         with tempfile.TemporaryDirectory() as t:
@@ -161,6 +195,19 @@ class DataTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_train_with_only_swiped_hand_labels(self):
+        with tempfile.TemporaryDirectory() as t:
+            project=Path(t);rows=fixture(project,6)
+            for row in rows:
+                a=empty_annotation(row['image_id']);a.update(status='approved',handedness='right',subject_id=row['image_id'])
+                write_json(annotation_path(project,row['image_id']),a)
+            result=train(project,project/'runs/train',epochs=1,batch_size=3)
+            self.assertEqual(result['schema'],SCHEMA);self.assertEqual(result['validation']['reference_samples'],0)
+            self.assertIsNone(result['validation']['reference_error_palm_width'])
+            for line in result['validation']['lines'].values():
+                self.assertEqual(line['present'],0);self.assertEqual(line['absent'],0)
+                self.assertFalse(line['auto_label_supported'])
+
     def test_train_with_unknown_side_metadata(self):
         with tempfile.TemporaryDirectory() as t:
             project=Path(t);rows=fixture(project,6)
@@ -189,7 +236,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn('held_out_subject', (project/'pseudo2/manual_review.jsonl').read_text())
     def test_validation_and_geometry_gates(self):
         model=PoseCNN();a=annotation('0'*20);points=np.array([p for name in LINES for p in a['lines'][name]['points']]+a['palm_width_points'])
-        prediction={'points':points,'std':np.zeros((26,2)),'presence':np.ones(4)*.999,'apparent_right_score':.999}
+        prediction={'points':points,'std':np.zeros((TOTAL_POINTS,2)),'presence':np.ones(len(LINES))*.999,'right_hand_score':.999}
         model.metadata={'positive_counts':dict.fromkeys(LINES,10),'validation':{'samples':10,'reference_error_palm_width':.01,'hand_accuracy':1,'lines':{k:{'auto_label_supported':True} for k in LINES}}}
         with patch.object(model,'predict',return_value=prediction):
             result=infer(model,np.zeros((500,500,3),np.uint8),'no');self.assertFalse(result['needs_review'])
@@ -200,6 +247,22 @@ class WorkflowTests(unittest.TestCase):
 
 
 class WebTests(unittest.TestCase):
+    def test_swipe_saves_hand_and_partial_data_without_filling_missing_fields(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);project=root/'artifacts/keypoints/test';rows=fixture(project,3)
+            app=Flask(__name__);register_keypoint_ui(app,root,'token','nonce');c=app.test_client()
+            image_id=rows[0]['image_id'];a=empty_annotation(image_id)
+            a['lines']['heart_line']['points']=[[.2,.3]]
+            url=f'/api/keypoints/swipe/test/{image_id}'
+            result=c.post(url,json={'handedness':'left','annotation':a});self.assertEqual(result.status_code,200)
+            stored=read_json(annotation_path(project,image_id))
+            self.assertEqual(stored['handedness'],'left');self.assertEqual(stored['status'],'approved')
+            self.assertEqual(stored['palm_width_points'],[]);self.assertEqual(stored['lines']['life_line']['status'],'unreviewed')
+            self.assertEqual(stored['lines']['heart_line']['points'],[[.2,.3]])
+            self.assertEqual(c.post(url,json={'handedness':'right','annotation':a}).status_code,409)
+            b=result.json['annotation'];result=c.post(url,json={'handedness':'right','annotation':b})
+            self.assertEqual(result.status_code,200);self.assertEqual(result.json['annotation']['handedness'],'right')
+
     def test_metadata_and_review_queue(self):
         import io
         from palm_keypoints.data import create_from_pseudo

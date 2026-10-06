@@ -12,8 +12,8 @@ import uuid
 from PIL import Image,ImageOps
 import numpy as np
 from flask import request,jsonify,render_template,send_file
-from . import LINES
-from .data import load_project,read_json,write_json,annotation_path,validate_annotation,audited_rows,safe_path
+from . import LINES,SCHEMA
+from .data import load_project,read_json,write_json,annotation_path,validate_annotation,audited_rows,safe_path,normalize_annotation
 from .model import PoseCNN
 from .spline import trace_line,width_from_points
 from .workflow import infer
@@ -48,10 +48,10 @@ def register_keypoint_ui(app,project_dir,csrf,nonce,legacy_busy=lambda:False):
         reports=sorted((path/'runs').glob('train_*/summary.json'),key=lambda p:p.stat().st_mtime,reverse=True)
         for report in reports:
             result=read_json(report)
-            if result.get('ok') and result.get('checkpoint'):
+            if result.get('ok') and result.get('checkpoint') and result.get('schema')==SCHEMA:
                 checkpoint=Path(result['checkpoint']).resolve()
                 if checkpoint.is_relative_to(path.resolve()) and checkpoint.is_file():return {'project':project_name,'checkpoint':str(checkpoint),'sha256':result['sha256']}
-        raise ValueError('Chưa có checkpoint keypoint được train cho project này.')
+        raise ValueError('Chưa có mô hình 3 đường cho bộ ảnh này. Huấn luyện lại trong mục Công cụ.')
 
 
     def begin(kind,args,out,project_name):
@@ -96,7 +96,7 @@ def register_keypoint_ui(app,project_dir,csrf,nonce,legacy_busy=lambda:False):
         return value
 
     @app.get('/keypoints')
-    def kp_page():return render_template('keypoints.html',csrf=csrf,nonce=nonce,lines=LINES)
+    def kp_page():return render_template('keypoints.html',csrf=csrf,nonce=nonce,lines=LINES,schema=SCHEMA)
 
     @app.get('/api/keypoints/state')
     @api_error
@@ -109,7 +109,7 @@ def register_keypoint_ui(app,project_dir,csrf,nonce,legacy_busy=lambda:False):
                 counts={'pending':0,'approved':0,'rejected':0}
                 for row in doc['images']:
                     a=read_json(annotation_path(path.parent,row['image_id']));counts[a['status']]+=1
-                projects.append({'name':path.parent.name,'count':len(doc['images']),'counts':counts})
+                projects.append({'name':path.parent.name,'count':len(doc['images']),'counts':counts,'tutorial_only':doc.get('tutorial_only',False)})
             except (ValueError,OSError,KeyError,TypeError,AttributeError) as exc:
                 project_errors.append({'name':path.parent.name,'error':str(exc)})
         runs=[p.parent.parent.name for p in (root/'artifacts').glob('*/review/review.csv')]
@@ -130,8 +130,9 @@ def register_keypoint_ui(app,project_dir,csrf,nonce,legacy_busy=lambda:False):
     @app.get('/api/keypoints/project/<project_name>')
     @api_error
     def kp_project(project_name):
-        _,doc=project(project_name)
-        return jsonify(ok=True,images=[{k:r[k] for k in ('image_id','width','height')} for r in doc['images']],tutorial_only=doc.get('tutorial_only',False),tutorial_note=doc.get('tutorial_note',''))
+        path,doc=project(project_name)
+        images=[{**{k:r[k] for k in ('image_id','width','height')},'status':read_json(annotation_path(path,r['image_id']))['status']} for r in doc['images']]
+        return jsonify(ok=True,schema=SCHEMA,images=images,tutorial_only=doc.get('tutorial_only',False),tutorial_note=doc.get('tutorial_note',''))
 
     @app.get('/keypoints/assets/<project_name>/<image_id>')
     @api_error
@@ -143,7 +144,7 @@ def register_keypoint_ui(app,project_dir,csrf,nonce,legacy_busy=lambda:False):
     @api_error
     def kp_annotation(project_name,image_id):
         path,doc=project(project_name);item_for(doc,image_id)
-        return jsonify(ok=True,annotation=read_json(annotation_path(path,image_id)))
+        return jsonify(ok=True,annotation=normalize_annotation(read_json(annotation_path(path,image_id))))
 
     @app.post('/api/keypoints/annotation/<project_name>/<image_id>')
     @api_error
@@ -164,9 +165,28 @@ def register_keypoint_ui(app,project_dir,csrf,nonce,legacy_busy=lambda:False):
         b=body();_,doc=project(project_name);item=item_for(doc,image_id);size=(item['width'],item['height'])
         b['status']='pending';a=validate_annotation(b,size)
         try:width=width_from_points(a['palm_width_points'],size)
-        except ValueError:return jsonify(ok=True,lines={},message='Đặt 2 điểm bề rộng lòng bàn tay để xem B-spline và độ dài chuẩn hóa.')
-        result={k:trace_line(v['points'],size,width,min_confidence=0) for k,v in a['lines'].items() if v['status']!='absent' and v['points']}
+        except ValueError:width=None
+        result={k:trace_line(v['points'],size,width or max(size),min_confidence=0) for k,v in a['lines'].items() if v['status']!='absent' and v['points']}
+        if width is None:
+            for traced in result.values():traced['length_to_palm_ratio']=None
         return jsonify(ok=True,lines=result,palm_width_px=width)
+
+    @app.post('/api/keypoints/swipe/<project_name>/<image_id>')
+    @api_error
+    def kp_swipe(project_name,image_id):
+        b=body();hand=b.get('handedness');payload=b.get('annotation')
+        if hand not in ('left','right') or not isinstance(payload,dict):raise ValueError('Chọn tay trái hoặc tay phải để lưu.')
+        path,doc=project(project_name);item=item_for(doc,image_id)
+        with lock:
+            if state['status']=='running' and state.get('project')==project_name:raise ValueError('Đợi tác vụ hiện tại hoàn thành trước khi lưu.')
+            previous=read_json(annotation_path(path,image_id))
+            if payload.get('revision')!=previous['revision']:return jsonify(ok=False,error='Nhãn đã đổi ở cửa sổ khác. Lưu bản nháp ra JSON rồi tải lại ảnh.'),409
+            if payload.get('image_id')!=image_id:raise ValueError('Image ID không khớp.')
+            payload={**payload,'handedness':hand,'status':'approved'}
+            a=validate_annotation(payload,(item['width'],item['height']));a['revision']=previous['revision']+1
+            a['provenance']='tutorial_visual_example' if doc.get('tutorial_only') else 'human_swipe'
+            write_json(annotation_path(path,image_id),a)
+        return jsonify(ok=True,annotation=a)
 
     @app.post('/api/keypoints/action')
     @api_error
@@ -261,5 +281,5 @@ def register_keypoint_ui(app,project_dir,csrf,nonce,legacy_busy=lambda:False):
     @api_error
     def kp_annotations_export(project_name):
         path,doc=project(project_name)
-        data={'schema':doc['schema'],'source_report':doc.get('source_report'),'review_only':doc.get('review_only',False),'images':[{**item,'annotation':read_json(annotation_path(path,item['image_id']))} for item in doc['images']]}
+        data={'schema':doc['schema'],'source_report':doc.get('source_report'),'review_only':doc.get('review_only',False),'images':[{**item,'annotation':normalize_annotation(read_json(annotation_path(path,item['image_id'])))} for item in doc['images']]}
         return app.response_class(json.dumps(data,ensure_ascii=False,allow_nan=False),mimetype='application/json',headers={'Content-Disposition':'attachment; filename="annotations.json"'})

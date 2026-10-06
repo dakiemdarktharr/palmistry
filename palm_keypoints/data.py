@@ -8,7 +8,7 @@ import shutil
 import numpy as np
 from PIL import Image
 from prototype_common import read_rgb,sha256,perceptual_hash,group_rows,write_json
-from . import SCHEMA,LINES,N_POINTS
+from . import SCHEMA,LEGACY_SCHEMA,LINES,N_POINTS,TOTAL_POINTS
 from .spline import trace_line,width_from_points
 
 
@@ -32,9 +32,22 @@ def empty_annotation(image_id):
             'notes':'','lines':{name:{'status':'unreviewed','points':[]} for name in LINES}}
 
 
-def validate_annotation(annotation,image_size,approve=False):
+def normalize_annotation(annotation):
+    """Read v1 without discarding its fourth line or fabricating missing labels."""
     a=json.loads(json.dumps(annotation,allow_nan=False))
-    if not isinstance(a,dict) or a.get('schema')!=SCHEMA or not isinstance(a.get('lines'),dict) or set(a['lines'])!=set(LINES):raise ValueError('Schema phải là Heart/Head/Life/Fate, mỗi đường 6 điểm; không đổi Simian thành Fate.')
+    if not isinstance(a,dict):raise ValueError('Annotation phải là JSON object.')
+    if a.get('schema')==LEGACY_SCHEMA:
+        if not isinstance(a.get('lines'),dict) or set(a['lines'])!=set(LINES)|{'fate_line'}:raise ValueError('Schema v1 không hợp lệ.')
+        a.setdefault('legacy_lines',{})['fate_line']=a['lines'].pop('fate_line')
+        a['legacy_schema']=LEGACY_SCHEMA;a['schema']=SCHEMA
+    for key,value in empty_annotation(a.get('image_id','')).items():
+        if key not in ('schema','lines'):a.setdefault(key,value)
+    return a
+
+
+def validate_annotation(annotation,image_size,approve=False):
+    a=normalize_annotation(annotation)
+    if a.get('schema')!=SCHEMA or not isinstance(a.get('lines'),dict) or set(a['lines'])!=set(LINES):raise ValueError('Schema phải là Tâm đạo / Trí đạo / Sinh đạo, mỗi đường tối đa 6 điểm.')
     if a.get('status') not in ('pending','approved','rejected'):raise ValueError('Trạng thái annotation không hợp lệ.')
     for name in LINES:
         line=a['lines'][name]
@@ -47,10 +60,10 @@ def validate_annotation(annotation,image_size,approve=False):
     ref=np.asarray(a.get('palm_width_points',[]),float)
     if ref.shape!=(0,) and (ref.ndim!=2 or ref.shape[1]!=2 or len(ref)>2 or not np.isfinite(ref).all() or np.any((ref<0)|(ref>1))):raise ValueError('Điểm bề rộng không hợp lệ.')
     if approve or a['status']=='approved':
-        width=width_from_points(a.get('palm_width_points'),image_size)
+        # Missing fields remain unknown even after a swipe. Only supplied labels are checked.
+        width=width_from_points(a['palm_width_points'],image_size) if len(ref)==2 else max(image_size)
         for name in LINES:
             line=a['lines'][name]
-            if line['status']=='unreviewed':raise ValueError(f'Chưa kiểm tra {name}; không coi thiếu nhãn là absent.')
             if line['status']=='present':
                 result=trace_line(line['points'],image_size,width,min_confidence=0)
                 if not result['valid']:raise ValueError(f'{name}: '+', '.join(result['reasons']))
@@ -100,8 +113,25 @@ def create_from_review(run,project,count=100):
 
 def load_project(project):
     data=read_json(Path(project)/'project.json')
-    if data.get('schema')!=SCHEMA:raise ValueError('Project không phải keypoint schema hiện tại.')
+    if data.get('schema') not in (SCHEMA,LEGACY_SCHEMA):raise ValueError('Project không phải keypoint schema hiện tại.')
+    if data['schema']==LEGACY_SCHEMA:data={**data,'schema':SCHEMA,'legacy_schema':LEGACY_SCHEMA,'lines':list(LINES)}
     return data
+
+
+def migrate_project(project):
+    """Back up every original annotation before persisting the three-line schema."""
+    import uuid
+    project=Path(project);original=read_json(project/'project.json');doc=load_project(project)
+    paths=list((project/'annotations').glob('*.json'))
+    changed=[(p,read_json(p)) for p in paths if read_json(p).get('schema')==LEGACY_SCHEMA]
+    if original['schema']==SCHEMA and not changed:return {'ok':True,'changed':0}
+    backup=project/'backups'/('schema_v1_'+uuid.uuid4().hex)
+    write_json(backup/'project.json',original)
+    for path,a in changed:write_json(backup/'annotations'/path.name,a)
+    for path,a in changed:
+        updated=normalize_annotation(a);updated['revision']+=1;write_json(path,updated)
+    write_json(project/'project.json',doc)
+    return {'ok':True,'changed':len(changed),'backup':str(backup)}
 
 
 def limit_review_queue(project,count=100):
@@ -147,7 +177,7 @@ def audited_rows(project,seed=42):
 
 
 def export_yolo(project,out,seed=42):
-    """One palm object: 24 line points + 2 reference points; visibility 0 or 2."""
+    """One palm object: 18 line points + 2 optional reference points."""
     out=Path(out)
     if out.exists():raise FileExistsError('Thư mục export phải mới.')
     rows=audited_rows(project,seed)
@@ -156,14 +186,14 @@ def export_yolo(project,out,seed=42):
         a=row['annotation'];points=[]
         for name in LINES:
             points.extend([[float(x),float(y),2] for x,y in a['lines'][name]['points']] if a['lines'][name]['status']=='present' else [[0,0,0]]*N_POINTS)
-        points.extend([[float(x),float(y),2] for x,y in a['palm_width_points']])
+        points.extend([[float(x),float(y),2] for x,y in a['palm_width_points']] if len(a['palm_width_points'])==2 else [[0,0,0]]*2)
         # Full normalized image box is intentional: previews contain one hand, no detector-derived box.
         values=[0,.5,.5,1,1]+[v for point in points for v in point]
         image_dir=out/'images'/row['split'];label_dir=out/'labels'/row['split'];image_dir.mkdir(parents=True,exist_ok=True);label_dir.mkdir(parents=True,exist_ok=True)
         shutil.copy2(safe_path(project,row['image_path']),image_dir/(row['image_id']+'.jpg'))
         (label_dir/(row['image_id']+'.txt')).write_text(' '.join(map(str,values))+'\n',encoding='utf-8')
-    config=f'path: {json.dumps(out.resolve().as_posix())}\ntrain: images/train\nval: images/val\ntest: images/test\nkpt_shape: [26, 3]\nflip_idx: {list(range(26))}\nnames:\n  0: palm\n'
-    (out/'data.yaml').write_text(config,encoding='utf-8');write_json(out/'schema.json',{'schema':SCHEMA,'order':[f'{name}_{i}' for name in LINES for i in range(6)]+['palm_width_0','palm_width_1'],'note':'Coordinates are normalized. Fate is distinct from legacy Simian. No YOLO dependency is installed.'})
+    config=f'path: {json.dumps(out.resolve().as_posix())}\ntrain: images/train\nval: images/val\ntest: images/test\nkpt_shape: [{TOTAL_POINTS}, 3]\nflip_idx: {list(range(TOTAL_POINTS))}\nnames:\n  0: palm\n'
+    (out/'data.yaml').write_text(config,encoding='utf-8');write_json(out/'schema.json',{'schema':SCHEMA,'order':[f'{name}_{i}' for name in LINES for i in range(6)]+['palm_width_0','palm_width_1'],'note':'Missing/unreviewed landmarks have visibility 0. Original statuses are preserved in annotations.json. Fate is archived, not mapped to another line.'})
     write_json(out/'split.json',[{k:r[k] for k in ('image_id','subject_id','source_group','split','group_id')} for r in rows])
     write_json(out/'annotations.json',{'schema':SCHEMA,'images':[{**{k:r[k] for k in ('image_id','width','height','split','annotation')},'image_path':f"images/{r['split']}/{r['image_id']}.jpg"} for r in rows]})
     return {'ok':True,'count':len(rows),'out':str(out)}

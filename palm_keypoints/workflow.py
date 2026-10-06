@@ -4,32 +4,34 @@ import json
 import time
 import numpy as np
 from prototype_common import read_rgb,sha256,perceptual_hash
-from . import SCHEMA,LINES
+from . import SCHEMA,LINES,LINE_POINTS,TOTAL_POINTS
 from .data import audited_rows,load_project,read_json,write_json,safe_path,annotation_path
 from .model import PoseCNN,prepare_image,targets,from_model
 from .spline import trace_line,width_from_points
 
 
 def evaluate(model,rows,project):
-    stats={name:{'present':0,'absent':0,'tp':0,'fp':0,'fn':0,'errors':[]} for name in LINES}
+    stats={name:{'present':0,'absent':0,'unlabeled':0,'tp':0,'fp':0,'fn':0,'errors':[]} for name in LINES}
     widths=[];hands=[]
     for row in rows:
         rgb=read_rgb(safe_path(project,row['image_path']));h,w=rgb.shape[:2];a=row['annotation']
-        pred=model.predict(rgb);width=width_from_points(a['palm_width_points'],(w,h))
-        widths.append(float(np.linalg.norm((pred['points'][24:]-a['palm_width_points'])*[w-1,h-1],axis=1).mean()/width))
-        if a['handedness']!='unknown' and a['mirrored']!='unknown':
-            truth=(a['handedness']=='right')!=(a['mirrored']=='yes');hands.append((pred['apparent_right_score']>=.5)==truth)
+        pred=model.predict(rgb);width=None
+        if len(a['palm_width_points'])==2:
+            width=width_from_points(a['palm_width_points'],(w,h))
+            widths.append(float(np.linalg.norm((pred['points'][LINE_POINTS:]-a['palm_width_points'])*[w-1,h-1],axis=1).mean()/width))
+        if a['handedness']!='unknown':hands.append((pred['right_hand_score']>=.5)==(a['handedness']=='right'))
         for i,name in enumerate(LINES):
-            s=stats[name];positive=a['lines'][name]['status']=='present';detected=pred['presence'][i]>=.5
+            s=stats[name];line=a['lines'][name]
+            if line['status']=='unreviewed':s['unlabeled']+=1;continue
+            positive=line['status']=='present';detected=pred['presence'][i]>=.5
             s['present' if positive else 'absent']+=1;s['tp']+=int(positive and detected);s['fp']+=int(not positive and detected);s['fn']+=int(positive and not detected)
-            if positive:s['errors'].extend((np.linalg.norm((pred['points'][i*6:(i+1)*6]-a['lines'][name]['points'])*[w-1,h-1],axis=1)/width).tolist())
+            if positive and width:s['errors'].extend((np.linalg.norm((pred['points'][i*6:(i+1)*6]-line['points'])*[w-1,h-1],axis=1)/width).tolist())
     for s in stats.values():
         errors=s.pop('errors');s['mean_error_palm_width']=float(np.mean(errors)) if errors else None
         s['pck_at_005']=float(np.mean(np.asarray(errors)<=.05)) if errors else None
         s['precision']=s['tp']/max(1,s['tp']+s['fp']);s['recall']=s['tp']/max(1,s['tp']+s['fn'])
-        # A small validation set is insufficient evidence, even when loss is low.
-        s['auto_label_supported']=bool(s['present']>=3 and s['absent']>=3 and s['precision']>=.95 and s['recall']>=.9 and s['pck_at_005']>=.9)
-    return {'samples':len(rows),'lines':stats,'reference_error_palm_width':float(np.mean(widths)),
+        s['auto_label_supported']=bool(s['present']>=3 and s['absent']>=3 and s['precision']>=.95 and s['recall']>=.9 and s['pck_at_005'] is not None and s['pck_at_005']>=.9)
+    return {'samples':len(rows),'lines':stats,'reference_samples':len(widths),'reference_error_palm_width':float(np.mean(widths)) if widths else None,
             'hand_samples':len(hands),'hand_accuracy':float(np.mean(hands)) if hands else None,'confidence_semantics':'MC-dropout ranking, not calibrated probability'}
 
 
@@ -71,7 +73,7 @@ def train(project,out,epochs=60,batch_size=8,seed=42,lr=.001,patience=12):
     validation=evaluate(model,[r for r in rows if r['split']=='val'],project)
     test=evaluate(model,[r for r in rows if r['split']=='test'],project)
     metadata=model.metadata|{'validation':validation};model.save(out/'best.npz',metadata)
-    result={'ok':True,'checkpoint':str(out/'best.npz'),'sha256':sha256(out/'best.npz'),'epochs':len(history),
+    result={'ok':True,'schema':SCHEMA,'checkpoint':str(out/'best.npz'),'sha256':sha256(out/'best.npz'),'epochs':len(history),
             'validation':validation,'test':test,'seconds':time.monotonic()-start}
     write_json(out/'summary.json',result);return result
 
@@ -79,19 +81,19 @@ def train(project,out,epochs=60,batch_size=8,seed=42,lr=.001,patience=12):
 def infer(model,rgb,mirrored='unknown'):
     if mirrored not in ('unknown','yes','no'):raise ValueError('mirrored phải là unknown/yes/no.')
     h,w=rgb.shape[:2];pred=model.predict(rgb);points=np.asarray(pred['points']);std=np.asarray(pred['std']);reasons=[]
-    if points.shape!=(26,2) or std.shape!=(26,2) or not np.isfinite(points).all() or not np.isfinite(std).all():raise ValueError('Model trả keypoint sai shape hoặc không hữu hạn.')
-    scores=np.r_[pred['presence'],pred['apparent_right_score']]
-    if scores.shape!=(5,) or not np.isfinite(scores).all() or np.any((scores<0)|(scores>1)) or np.any(std<0):raise ValueError('Confidence model không hợp lệ.')
+    if points.shape!=(TOTAL_POINTS,2) or std.shape!=(TOTAL_POINTS,2) or not np.isfinite(points).all() or not np.isfinite(std).all():raise ValueError('Model trả keypoint sai shape hoặc không hữu hạn.')
+    scores=np.r_[pred['presence'],pred['right_hand_score']]
+    if scores.shape!=(len(LINES)+1,) or not np.isfinite(scores).all() or np.any((scores<0)|(scores>1)) or np.any(std<0):raise ValueError('Confidence model không hợp lệ.')
     validation=model.metadata.get('validation',{});line_validation=validation.get('lines',{})
-    try:width=width_from_points(points[24:],(w,h))
+    try:width=width_from_points(points[LINE_POINTS:],(w,h))
     except ValueError:width=0;reasons.append('invalid_palm_reference')
     uncertainty=np.linalg.norm(std*[w-1,h-1],axis=1)
     confidence=np.exp(-uncertainty/max(.05*width,1e-6))
-    if confidence[24:].min()<.90:reasons.append('uncertain_palm_reference')
-    if validation.get('reference_error_palm_width',1)>.05:reasons.append('reference_validation_insufficient')
-    right=float(pred['apparent_right_score']);side='unknown'
-    if mirrored!='unknown' and max(right,1-right)>=.90 and (validation.get('hand_accuracy') or 0)>=.95 and validation.get('hand_samples',0)>=6:
-        side='right' if ((right>=.5)!=(mirrored=='yes')) else 'left'
+    if confidence[LINE_POINTS:].min()<.90:reasons.append('uncertain_palm_reference')
+    if validation.get('reference_error_palm_width') is None or validation['reference_error_palm_width']>.05:reasons.append('reference_validation_insufficient')
+    right=float(pred['right_hand_score']);side='unknown'
+    if max(right,1-right)>=.90 and (validation.get('hand_accuracy') or 0)>=.95 and validation.get('hand_samples',0)>=6:
+        side='right' if right>=.5 else 'left'
     lines={}
     for i,name in enumerate(LINES):
         probability=float(pred['presence'][i]);supported=line_validation.get(name,{}).get('auto_label_supported',False)
@@ -107,7 +109,7 @@ def infer(model,rgb,mirrored='unknown'):
                      'presence_score':probability,'trace':traced,'reasons':issues}
     needs_review=bool(reasons) or any(v['status']=='review' for v in lines.values())
     return {'schema':SCHEMA,'image_size':[w,h],'mirrored':mirrored,'handedness':side,'hand_score':right,
-            'palm_width_points':points[24:].tolist(),'palm_width_px':width,'lines':lines,'needs_review':needs_review,
+            'palm_width_points':points[LINE_POINTS:].tolist(),'palm_width_px':width,'lines':lines,'needs_review':needs_review,
             'reasons':reasons,'confidence_semantics':'uncalibrated MC-dropout ranking; validation and geometry gates also required'}
 
 

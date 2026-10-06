@@ -1,6 +1,6 @@
-## Pipeline keypoint mới (Heart / Head / Life / Fate)
+## Palm Studio · Tâm đạo / Trí đạo / Sinh đạo
 
-Bấm **Palmistry Live Camera** trên Desktop để mở app dán nhãn. Đặt 6 điểm mỗi đường, 2 điểm bề rộng rồi bấm **Duyệt & ảnh tiếp**; không cần điền bên tay/lật gương. Phần metadata và huấn luyện nằm trong mục mở rộng. Địa chỉ kiểm tra: http://127.0.0.1:8501/keypoints. Không dùng PyTorch/scikit-learn. Hướng dẫn và giới hạn: [docs/KEYPOINT_PIPELINE.md](docs/KEYPOINT_PIPELINE.md).
+Bấm **Palmistry Live Camera** trên Desktop để mở app. Vẽ 3 đường chính bằng cách kéo trên ảnh, đặt 2 mép bề rộng rồi **quẹt trái nếu tay trái, quẹt phải nếu tay phải** để lưu và chuyển ảnh. Phần chưa nhập giữ trống; có thể hoàn tác quẹt. Giao diện React dùng Mantine và React Aria, được build cục bộ, không cần CDN hoặc Node khi mở. Hướng dẫn: [docs/KEYPOINT_PIPELINE.md](docs/KEYPOINT_PIPELINE.md).
 
 Project `palm_keypoints_main` có chỉ tiêu 100 ảnh; các ảnh vượt chỉ tiêu được giữ trong danh sách nguồn còn lại. Cần nhãn keypoint thật trước khi train; checkpoint segmentation cũ không dùng trực tiếp cho mô hình mới. Các phần mask/camera bên dưới là legacy và được giữ để đối chiếu.
 

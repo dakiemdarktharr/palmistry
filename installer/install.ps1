@@ -14,7 +14,7 @@ if ($targetPrefix.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCas
     throw "InstallDir must not overlap the source repository (same directory, child or parent)."
 }
 New-Item -ItemType Directory -Force -Path $targetRoot | Out-Null
-$excluded = @(".git", ".venv", ".web_bundle", ".web_live_tmp", ".web_static", "artifacts", "dataset", ".codex", ".agents", "__pycache__")
+$excluded = @(".git", "frontend", ".venv", ".web_bundle", ".web_live_tmp", ".web_static", "artifacts", "dataset", ".codex", ".agents", "__pycache__")
 Get-ChildItem -LiteralPath $sourceRoot -Force | ForEach-Object {
     if ($excluded -notcontains $_.Name) {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $targetRoot $_.Name) -Recurse -Force

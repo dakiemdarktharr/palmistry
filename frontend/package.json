@@ -1,0 +1,22 @@
+{
+  "name": "palmistry-labeler",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && node scripts/licenses.mjs",
+    "test": "node --test src/*.test.js"
+  },
+  "dependencies": {
+    "@mantine/core": "9.7.1",
+    "@mantine/hooks": "9.7.1",
+    "lucide-react": "1.52.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-aria": "3.52.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "6.1.2",
+    "vite": "8.3.3"
+  }
+}

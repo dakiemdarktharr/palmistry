@@ -3,9 +3,9 @@ import json
 from pathlib import Path
 import numpy as np
 import cv2
-from . import SCHEMA,LINES,TOTAL_POINTS
+from . import SCHEMA,LINES,TOTAL_POINTS,LINE_POINTS,COORDS
 
-VERSION='numpy-palm-pose-cnn-v1'
+VERSION='numpy-palm-pose-cnn-v2'
 SIZE=64
 OUTPUT=TOTAL_POINTS*2+len(LINES)+1
 
@@ -34,11 +34,12 @@ def targets(annotation,meta):
     for i,name in enumerate(LINES):
         line=annotation['lines'][name];visible=line['status']=='present';presence.append(float(visible))
         if visible:coords[i*6:(i+1)*6]=to_model(line['points'],meta);mask[i*6:(i+1)*6]=1
-    coords[24:]=to_model(annotation['palm_width_points'],meta);mask[24:]=1
-    apparent_right=(annotation['handedness']=='right') != (annotation['mirrored']=='yes')
+    if len(annotation['palm_width_points'])==2:
+        coords[LINE_POINTS:]=to_model(annotation['palm_width_points'],meta);mask[LINE_POINTS:]=1
+    apparent_right=annotation['handedness']=='right'
     target=np.r_[coords.ravel(),presence,float(apparent_right)].astype(np.float32)
-    known_side=annotation['handedness']!='unknown' and annotation['mirrored']!='unknown'
-    return target,np.r_[mask.ravel(),np.ones(4),float(known_side)].astype(np.float32)
+    known_side=annotation['handedness']!='unknown'
+    return target,np.r_[mask.ravel(),[float(annotation['lines'][name]['status']!='unreviewed') for name in LINES],float(known_side)].astype(np.float32)
 
 
 def conv(x,w,b):
@@ -66,9 +67,9 @@ class PoseCNN:
         self.p['w4']*=.05
         # Start near broad plausible locations rather than the same collapsed point.
         base=[]
-        for y in (.36,.50,.63,.70):base.extend([[x,y] for x in np.linspace(.25,.75,6)])
+        for y in (.36,.50,.63):base.extend([[x,y] for x in np.linspace(.25,.75,6)])
         base.extend([[.2,.6],[.8,.6]])
-        q=np.asarray(base).ravel();self.p['b4'][:52]=np.log(q/(1-q))
+        q=np.asarray(base).ravel();self.p['b4'][:COORDS]=np.log(q/(1-q))
 
     def features(self,x):
         z1,c1=conv(x,self.p['w1'],self.p['b1']);a1=np.maximum(z1,0)
@@ -81,13 +82,13 @@ class PoseCNN:
         hidden,cache=self.features(x)
         drop=(self.rng.random(hidden.shape)>=dropout).astype(np.float32)/(1-dropout) if dropout else np.ones_like(hidden)
         hd=hidden*drop;logits=hd@self.p['w4']+self.p['b4'];out=sigmoid(logits)
-        d=out[:,:52]-target[:,:52];valid=mask[:,:52];den=max(1,float(valid.sum()));delta=.05
+        d=out[:,:COORDS]-target[:,:COORDS];valid=mask[:,:COORDS];den=max(1,float(valid.sum()));delta=.05
         huber=np.where(np.abs(d)<delta,.5*d*d/delta,np.abs(d)-.5*delta)
         coordinate_loss=float((huber*valid).sum()/den)
-        class_mask=mask[:,52:];class_den=max(1,float(class_mask.sum()))
-        classification_loss=float(((np.logaddexp(0,logits[:,52:])-target[:,52:]*logits[:,52:])*class_mask).sum()/class_den)
-        grad=np.zeros_like(out);grad[:,:52]=np.clip(d/delta,-1,1)*valid/den*out[:,:52]*(1-out[:,:52])
-        grad[:,52:]=.15*(out[:,52:]-target[:,52:])*class_mask/class_den
+        class_mask=mask[:,COORDS:];class_den=max(1,float(class_mask.sum()))
+        classification_loss=float(((np.logaddexp(0,logits[:,COORDS:])-target[:,COORDS:]*logits[:,COORDS:])*class_mask).sum()/class_den)
+        grad=np.zeros_like(out);grad[:,:COORDS]=np.clip(d/delta,-1,1)*valid/den*out[:,:COORDS]*(1-out[:,:COORDS])
+        grad[:,COORDS:]=.15*(out[:,COORDS:]-target[:,COORDS:])*class_mask/class_den
         grads={'w4':hd.T@grad,'b4':grad.sum(axis=0)};dh=(grad@self.p['w4'].T)*drop
         z1,c1,z2,c2,flat,z3=cache;dz3=dh*(z3>0);grads['w3']=flat.T@dz3;grads['b3']=dz3.sum(axis=0)
         dz2=(dz3@self.p['w3'].T).reshape(z2.shape)*(z2>0)
@@ -114,9 +115,9 @@ class PoseCNN:
         for _ in range(mc_samples):
             drop=(rng.random(hidden.shape)>=.15)/.85
             draws.append(sigmoid((hidden*drop)@self.p['w4']+self.p['b4'])[0])
-        draws=np.asarray(draws);mean=draws.mean(axis=0);coords=from_model(mean[:52].reshape(-1,2),meta)
-        std=draws[:,:52].std(axis=0).reshape(-1,2)*(SIZE-1)/[meta['nw']-1,meta['nh']-1]
-        return {'points':coords,'std':std,'presence':mean[52:56],'apparent_right_score':float(mean[56])}
+        draws=np.asarray(draws);mean=draws.mean(axis=0);coords=from_model(mean[:COORDS].reshape(-1,2),meta)
+        std=draws[:,:COORDS].std(axis=0).reshape(-1,2)*(SIZE-1)/[meta['nw']-1,meta['nh']-1]
+        return {'points':coords,'std':std,'presence':mean[COORDS:COORDS+len(LINES)],'right_hand_score':float(mean[-1])}
 
     def save(self,path,metadata):
         path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
@@ -132,7 +133,7 @@ class PoseCNN:
         model=cls()
         with np.load(path,allow_pickle=False) as z:
             metadata=json.loads(str(z['metadata'].item()))
-            if not isinstance(metadata,dict) or metadata.get('schema')!=SCHEMA or metadata.get('model_version')!=VERSION or metadata.get('lines')!=list(LINES) or metadata.get('input_size')!=SIZE or metadata.get('keypoints')!=6:raise ValueError('Checkpoint không phải Heart/Head/Life/Fate keypoint CNN.')
+            if not isinstance(metadata,dict) or metadata.get('schema')!=SCHEMA or metadata.get('model_version')!=VERSION or metadata.get('lines')!=list(LINES) or metadata.get('input_size')!=SIZE or metadata.get('keypoints')!=6:raise ValueError('Checkpoint không phải Tâm đạo/Trí đạo/Sinh đạo keypoint CNN v2.')
             for k,template in model.p.items():
                 value=np.asarray(z[k],np.float32)
                 if value.shape!=template.shape or not np.isfinite(value).all():raise ValueError('Checkpoint shape/giá trị không hợp lệ.')

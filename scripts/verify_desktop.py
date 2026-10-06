@@ -24,20 +24,16 @@ from PIL import Image
 
 
 def main():
-    web = Flask(__name__, template_folder=str(ROOT / "templates"))
+    web = Flask(__name__, template_folder=str(ROOT / "templates"), static_folder=str(ROOT / "static"))
     fixture = tempfile.TemporaryDirectory(prefix="palm-desktop-data-")
     project = Path(fixture.name) / "artifacts/keypoints/desktop_smoke"
     rows = []
-    for i in range(2):
+    for i in range(3):
         image_id = f"{i:020x}"
         image_path = project / "images" / (image_id + ".jpg")
         image_path.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (500,500), "#ab9478").save(image_path)
         a = empty_annotation(image_id)
-        a['palm_width_points'] = [[.15,.8],[.85,.8]]
-        for j,name in enumerate(LINES):
-            a['lines'][name] = {'status':'present','points':[[.2+k*.12,.25+j*.12] for k in range(6)]}
-        a['lines'][LINES[0]] = {'status':'unreviewed','points':[]}
         write_json(annotation_path(project,image_id),a)
         rows.append({'image_id':image_id,'image_path':'images/'+image_id+'.jpg','width':500,'height':500})
     write_json(project/'project.json',{'schema':SCHEMA,'images':rows})
@@ -50,9 +46,17 @@ def main():
             unloaded.set()
         return "", 204
 
-    @web.get("/keypoints")
-    def page():
-        return render_template("keypoints.html", csrf="test-token", nonce="test-nonce", lines=LINES)
+    fail_next = {'value': True}
+    @web.before_request
+    def simulate_storage_failure():
+        if request.method=='POST' and '/swipe/' in request.path and fail_next['value']:
+            fail_next['value']=False
+            return jsonify(ok=False,error='TEST write failure; retry safely'),503
+
+    @web.after_request
+    def csp(response):
+        response.headers['Content-Security-Policy']="default-src 'self'; script-src 'nonce-test-nonce'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'"
+        return response
 
     @web.get("/download")
     def download():
@@ -92,82 +96,116 @@ def main():
             download.isFinishedChanged.connect(lambda: finished(download))
             save_download(window, download)
 
-        def inspect(value):
-            try:
-                doc = json.loads(value)
-                assert "100" in doc["heading"] and doc["canvas"] and doc["fileInput"]
-                assert not doc["handFields"] and doc["steps"], "simplified annotation controls missing"
-                assert doc["lineButtons"] == 4, "template JavaScript did not run"
-                window.view.page().runJavaScript("""
-                    (()=>{
-                      const canvas=document.getElementById('canvas'),r=canvas.getBoundingClientRect();
-                      canvas.setPointerCapture=()=>{};
-                      for(let k=0;k<6;k++){
-                        canvas.onpointerdown({clientX:r.left+(.2+k*.12)*r.width,clientY:r.top+.25*r.height,pointerId:1});
-                        canvas.onpointerup();
-                      }
-                      document.querySelector('[data-line="fate_line"]').click();
-                      document.getElementById('absent').click();
-                      document.getElementById('approve').click();
-                    })()
-                """)
-                QTimer.singleShot(1500, check_annotation)
-            except Exception as exc:
-                result["error"] = str(exc)
-                application.quit()
+        page = window.view.page()
+        def fail(error):
+            result['error']=str(error)
+            application.quit()
 
-        annotation_checks = 0
-        def check_annotation():
-            nonlocal annotation_checks
-            annotation_checks += 1
-            try:
-                a=read_json(annotation_path(project,rows[0]['image_id']))
-                if a['status']=='pending' and annotation_checks<30:
-                    QTimer.singleShot(200, check_annotation)
-                    return
-                assert a['status']=='approved' and a['mirrored']=='unknown' and a['handedness']=='unknown'
-                assert len(a['lines'][LINES[0]]['points'])==6 and a['lines']['fate_line']['status']=='absent'
-                assert read_json(annotation_path(project,rows[1]['image_id']))['status']=='pending'
-                window.view.page().runJavaScript("document.getElementById('index').value", check_next)
-            except Exception as exc:
-                result['error']=str(exc)
-                application.quit()
+        def wait_for(expression,callback,attempt=0):
+            def checked(value):
+                if value:
+                    try:callback()
+                    except Exception as exc:fail(exc)
+                elif attempt<100:QTimer.singleShot(100,lambda:wait_for(expression,callback,attempt+1))
+                else:fail('Timed out: '+expression)
+            page.runJavaScript('Boolean('+expression+')',checked)
 
-        def check_next(value):
-            try:
-                assert str(value)=='2', 'approval did not advance to the next image'
-                result.update(annotation=True, nextImage=True)
-                popup = window.view.createWindow(None)
-                assert popup.window().windowTitle() == "Palmistry Live Camera"
-                popup.window().close()
-                result.update(template=True, popup=True)
-                window.view.page().runJavaScript(
-                    "window.closeProofCount=0;"
-                    "window.addEventListener('beforeunload',()=>navigator.sendBeacon('/close-proof',String(++window.closeProofCount)));"
-                    "location.href='/download'")
-            except Exception as exc:
-                result["error"] = str(exc)
-                application.quit()
+        def execute(script,callback):
+            page.runJavaScript(script,lambda _:QTimer.singleShot(50,callback))
+
+        def stored(index):return read_json(annotation_path(project,rows[index]['image_id']))
+
+        def gesture(distance,cancel=False):
+            return """(()=>{
+              const h=document.getElementById('swipeHandle'),r=h.getBoundingClientRect();
+              const x=r.left+r.width/2,y=r.top+r.height/2;
+              h.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,button:0,buttons:1,pointerId:7,pointerType:'mouse',clientX:x,clientY:y}));
+              window.dispatchEvent(new PointerEvent('pointermove',{bubbles:true,button:0,buttons:1,pointerId:7,pointerType:'mouse',clientX:x+DISTANCE,clientY:y}));
+              window.dispatchEvent(new PointerEvent('EVENT',{bubbles:true,button:0,buttons:0,pointerId:7,pointerType:'mouse',clientX:x+DISTANCE,clientY:y}));
+            })()""".replace('DISTANCE',str(distance)).replace('EVENT','pointercancel' if cancel else 'pointerup')
+
+        def canvas_point(x,y):
+            return f"""(()=>{{
+              const c=document.getElementById('canvas'),r=c.getBoundingClientRect();c.setPointerCapture=()=>{{}};
+              for(const type of ['pointerdown','pointerup'])c.dispatchEvent(new PointerEvent(type,{{bubbles:true,button:0,pointerId:1,pointerType:'mouse',clientX:r.left+{x}*r.width,clientY:r.top+{y}*r.height}}));
+            }})()"""
+
+        def draw():
+            assert len(LINES)==3
+            result.update(template=True)
+            execute("""(()=>{
+              const c=document.getElementById('canvas'),r=c.getBoundingClientRect();c.setPointerCapture=()=>{};
+              function event(type,x){c.dispatchEvent(new PointerEvent(type,{bubbles:true,button:0,buttons:type==='pointerup'?0:1,pointerId:1,pointerType:'mouse',clientX:r.left+x*r.width,clientY:r.top+.3*r.height}));}
+              event('pointerdown',.2);for(let i=1;i<=20;i++)event('pointermove',.2+i*.03);event('pointerup',.8);
+            })()""",lambda:wait_for("document.querySelector('[data-tool=heart_line] small')?.textContent==='Đã vẽ'",select_width))
+
+        def select_width():
+            execute("document.querySelector('[data-tool=width]').click()",lambda:wait_for("document.querySelector('[data-tool=width]')?.getAttribute('aria-pressed')==='true'",width_first))
+
+        def width_first():
+            execute(canvas_point(.15,.8),lambda:wait_for("document.querySelector('[data-tool=width] small')?.textContent==='1/2 điểm'",width_second))
+
+        def width_second():
+            execute(canvas_point(.85,.8),lambda:wait_for("document.querySelector('[data-tool=width] small')?.textContent==='Đã vẽ'",try_failure))
+
+        def try_failure():
+            execute("document.getElementById('chooseLeft').click()",lambda:wait_for("document.getElementById('message')?.textContent.includes('TEST write failure') && !document.getElementById('chooseLeft').disabled",verify_failure))
+
+        def verify_failure():
+            assert stored(0)['status']=='pending' and stored(0)['palm_width_points']==[]
+            result['retryPreservesDraft']=True
+            # A cancelled long gesture and a short gesture must not save.
+            execute(gesture(-130,True),lambda:execute(gesture(-30),lambda:QTimer.singleShot(250,retry)))
+
+        def retry():
+            assert stored(0)['status']=='pending'
+            result['cancelledSwipe']=True
+            execute(gesture(-140),lambda:wait_for("document.getElementById('photoCard')?.dataset.imageId==='00000000000000000001' && !document.getElementById('chooseLeft').disabled",verify_left))
+
+        def verify_left():
+            a=stored(0)
+            assert a['status']=='approved' and a['handedness']=='left'
+            assert len(a['lines']['heart_line']['points'])==6 and len(a['palm_width_points'])==2
+            assert a['lines']['head_line']=={'status':'unreviewed','points':[]}
+            assert a['lines']['life_line']=={'status':'unreviewed','points':[]}
+            result.update(freehand=True,swipe=True,partialAnnotations=True)
+            execute("document.getElementById('undoSwipe').click()",lambda:wait_for("document.getElementById('photoCard')?.dataset.imageId==='00000000000000000000' && !document.getElementById('chooseLeft').disabled",verify_undo))
+
+        def verify_undo():
+            assert stored(0)['status']=='pending' and stored(0)['handedness']=='unknown'
+            assert len(stored(0)['lines']['heart_line']['points'])==6
+            result['undoSwipe']=True
+            execute("document.getElementById('chooseLeft').click()",lambda:wait_for("document.getElementById('photoCard')?.dataset.imageId==='00000000000000000001' && !document.getElementById('chooseRight').disabled",save_empty))
+
+        def save_empty():
+            execute(gesture(140),lambda:wait_for("document.getElementById('photoCard')?.dataset.imageId==='00000000000000000002' && !document.getElementById('chooseLeft').disabled",verify_empty))
+
+        def verify_empty():
+            a=stored(1)
+            assert a['status']=='approved' and a['handedness']=='right' and a['palm_width_points']==[]
+            assert all(line=={'status':'unreviewed','points':[]} for line in a['lines'].values())
+            result['emptySwipe']=True
+            QTimer.singleShot(500, capture_and_download)
+
+        def capture_and_download():
+            output_dir=ROOT/'artifacts/desktop-swipe'
+            output_dir.mkdir(parents=True,exist_ok=True)
+            window.grab().save(str(output_dir/'labeler.png'))
+            popup=window.view.createWindow(None)
+            assert popup.window().windowTitle()=='Palmistry Live Camera'
+            popup.window().close();result['popup']=True
+            page.runJavaScript("window.closeProofCount=0;window.addEventListener('beforeunload',()=>navigator.sendBeacon('/close-proof',String(++window.closeProofCount)));location.href='/download'")
 
         def loaded(ok):
             window.view.loadFinished.disconnect(loaded)
-            if not ok:
-                result["error"] = "local template did not load"
-                application.quit()
-                return
-            QTimer.singleShot(1000, lambda: window.view.page().runJavaScript(
-                "JSON.stringify({heading:document.querySelector('h1')?.textContent,"
-                "canvas:!!document.getElementById('canvas'),"
-                "fileInput:!!document.querySelector('input[type=file]'),"
-                "lineButtons:document.querySelectorAll('[data-line]').length,"
-                "handFields:!!document.querySelector('#hand,#mirror,#predictMirror'),"
-                "steps:!!document.getElementById('stepHint')?.textContent})", inspect))
+            if not ok:fail('local template did not load');return
+            wait_for("document.querySelectorAll('[data-line]').length===3 && document.getElementById('canvas') && !document.getElementById('chooseLeft').disabled && !document.querySelector('.photo-loading')",draw)
 
         QWebEngineProfile.defaultProfile().downloadRequested.connect(requested)
         window.view.loadFinished.connect(loaded)
         window.view.setUrl(QUrl(f"http://127.0.0.1:{server.server_port}/keypoints"))
         window.show()
-        QTimer.singleShot(20000, application.quit)
+        QTimer.singleShot(45000, application.quit)
         try:
             application.exec()
         finally:

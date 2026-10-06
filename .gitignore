@@ -17,4 +17,6 @@ predicted_mask.png
 prediction_overlay.jpg
 prediction_result.json
 dist/
+node_modules/
+.npm-cache/
 *.log
