@@ -1,0 +1,14 @@
+{
+  "seed": 42,
+  "device": "cpu",
+  "checkpoint": "",
+  "checkpoint_sha256": "",
+  "out_size": 256,
+  "input_size": 256,
+  "strict_line_threshold": 0.72,
+  "read_threshold": 0.85,
+  "min_image_quality": 0.5,
+  "retention_seconds": 0,
+  "prediction_interval_seconds": 2.0,
+  "prediction_timeout_seconds": 30.0
+}

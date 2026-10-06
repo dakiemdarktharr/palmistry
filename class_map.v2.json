@@ -1,0 +1,13 @@
+{
+  "version": "palm-lines-v2",
+  "classes": {
+    "0": "background",
+    "1": "palm_area",
+    "2": "life_line",
+    "3": "head_line",
+    "4": "heart_line",
+    "5": "minor_or_unknown_line",
+    "6": "simian_line"
+  },
+  "migration": "Class 0..5 retain v1 meanings; class 6 is the single transverse palmar crease. Old checkpoints require retraining. Do not relabel unknown lines as simian."
+}

@@ -8,12 +8,12 @@ Mục tiêu:
 - Tự tạo pseudo-mask bằng Classical CV.
 - Lọc cực gắt ảnh/mask yếu.
 - Chỉ train 3 đường chính: Sinh đạo, Trí đạo, Tâm đạo + minor/unknown.
-- Khi predict chỉ xuất phần đạt ngưỡng confidence cao.
+- Khi predict chỉ xuất phần đạt ngưỡng heuristic_score (chưa hiệu chuẩn).
 - Nếu không đọc được, tự chẩn đoán lý do và yêu cầu chụp lại đúng vấn đề.
 
 Commands:
   doctor
-  build          Tự tải ảnh hoặc đọc folder ảnh, preprocess, tạo pseudo-mask, EDA.
+  build          Đọc folder ảnh local; remote download đã tắt.
   mask-folder    Tạo pseudo-mask từ folder ảnh local.
   single-mask    Tạo pseudo-mask cho 1 ảnh.
   train          Train segmentation model, checkpoint/resume/time limit.
@@ -43,7 +43,20 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 import numpy as np
+try:
+    import requests
+except Exception:
+    requests = None
+from prototype_common import (CLASS_MAP, CLASS_VERSION, MODEL_VERSION, validate_mask, validate_size,
+    read_rgb, write_class_map, check_class_map, group_rows, split_summary, perceptual_hash, read_manifest,
+    confusion_matrix, metrics_from_confusion, seed_everything, provenance, write_json, load_config)
 
 try:
     import cv2
@@ -57,47 +70,12 @@ except Exception:
     print("ERROR: pillow chưa được cài. Chạy: pip install pillow", file=sys.stderr)
     raise
 
-try:
-    import pandas as pd
-except Exception:
-    pd = None
-
-try:
-    from tqdm import tqdm
-except Exception:
-    tqdm = lambda x, **kwargs: x
-
-try:
-    import requests
-except Exception:
-    requests = None
-
-try:
-    import matplotlib.pyplot as plt
-except Exception:
-    plt = None
-
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    from torch.utils.data import Dataset, DataLoader
-    TORCH_AVAILABLE = True
-except Exception:
-    TORCH_AVAILABLE = False
-
 # -----------------------------
 # Constants
 # -----------------------------
-CLASS_MAP = {
-    0: "background",
-    1: "palm_area",
-    2: "life_line",
-    3: "head_line",
-    4: "heart_line",
-    5: "minor_or_unknown_line",
-}
-LINE_CLASSES = {2: "life_line", 3: "head_line", 4: "heart_line"}
+from palm_geometry import LINE_IDS, infer_handedness, measure_line, resolve_transverse_lines
+
+LINE_CLASSES = dict(LINE_IDS)
 DEFAULT_COMMONS_QUERIES = [
     "palm hand lines",
     "open palm hand",
@@ -142,23 +120,14 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
 def list_images(input_dir: Path) -> List[Path]:
     if not input_dir.exists():
         return []
-    return [p for p in input_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS and p.is_file()]
+    return sorted(p for p in input_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS and p.is_file())
 
 
 def imread_rgb(path: Path) -> Optional[np.ndarray]:
     try:
-        data = np.fromfile(str(path), dtype=np.uint8)
-        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        if img is None:
-            return None
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    except Exception:
-        try:
-            img = Image.open(path).convert("RGB")
-            return np.array(img)
-        except Exception:
-            return None
-
+        return read_rgb(path)
+    except (OSError, ValueError, Image.DecompressionBombError):
+        return None
 
 def imwrite_rgb(path: Path, img_rgb: np.ndarray) -> bool:
     try:
@@ -193,6 +162,7 @@ def imwrite_gray(path: Path, img: np.ndarray) -> bool:
 
 
 def resize_keep_aspect_pad(img: np.ndarray, out_size: int, pad_value: int = 0) -> Tuple[np.ndarray, Dict[str, Any]]:
+    validate_size(out_size)
     h, w = img.shape[:2]
     scale = out_size / max(h, w)
     nh, nw = int(round(h * scale)), int(round(w * scale))
@@ -570,16 +540,7 @@ def skeletonize_mask(binary: np.ndarray) -> np.ndarray:
 
 
 def estimate_thumb_side(palm_mask: np.ndarray) -> str:
-    """Very rough thumb side: side with more palm mass in lower/middle zones."""
-    m = (palm_mask > 0).astype(np.uint8)
-    h, w = m.shape
-    zone = m[int(0.30*h):int(0.85*h), :]
-    left = float(np.sum(zone[:, :w//2]))
-    right = float(np.sum(zone[:, w//2:]))
-    # thumb side tends to have larger Venus mount mass; if uncertain default left
-    if right > left * 1.08:
-        return "right"
-    return "left"
+    return infer_handedness(palm_mask, mirrored=None)["thumb_side_image"]
 
 
 def component_features(comp_mask: np.ndarray) -> Dict[str, float]:
@@ -634,6 +595,8 @@ def score_component_as_line(feat: Dict[str, float], thumb_side: str) -> Dict[str
         side_score = 1.0 - min(abs(cx - 0.28) / 0.32, 1.0)
     else:
         side_score = 1.0 - min(abs(cx - 0.72) / 0.32, 1.0)
+    if thumb_side == "unknown":
+        side_score = 0.0
     lower_span = normalize_score(feat["y1"] - feat["y0"], 0.12, 0.50)
     life_score = 0.30*side_score + 0.22*lower_span + 0.14*diag + 0.10*vert + 0.24*length_norm
     return {
@@ -711,6 +674,9 @@ def create_strict_pseudo_mask(img_rgb: np.ndarray, out_size: int = 1024, strict_
             assigned.add(best["idx"])
             line_scores[line_name] = float(best_score)
             line_lengths[line_name] = float(best["feat"]["length_px"])
+    # Simian requires supervised annotations; a missing heart/head is insufficient evidence.
+    line_scores["simian_line"] = 0.0
+    line_lengths["simian_line"] = 0.0
     # Remaining line-like components = minor/unknown, but only if sufficiently plausible.
     minor_pixels = 0
     for c in comps:
@@ -748,6 +714,8 @@ def create_strict_pseudo_mask(img_rgb: np.ndarray, out_size: int = 1024, strict_
         "component_count": len(comps),
         "strict_line_threshold": strict_line_threshold,
     }
+    validate_mask(sem, crop.shape[:2])
+    report.update({"inference_source": "classical CV fallback", "model_used": False, "class_map_version": CLASS_VERSION})
     return crop, sem, report
 
 
@@ -759,6 +727,7 @@ def make_overlay(img_rgb: np.ndarray, sem: np.ndarray, alpha: float = 0.55) -> n
         3: (0, 80, 255),      # head
         4: (255, 0, 255),     # heart
         5: (255, 200, 0),     # minor
+        6: (0, 230, 230),     # simian
     }
     overlay = img_rgb.copy()
     color_img = np.zeros_like(img_rgb)
@@ -773,151 +742,11 @@ def make_overlay(img_rgb: np.ndarray, sem: np.ndarray, alpha: float = 0.55) -> n
 # -----------------------------
 def download_commons_images(out_dir: Path, target_count: int = 1000, max_downloads: int = 5000,
                             queries: Optional[List[str]] = None, sleep: float = 0.05) -> List[Path]:
-    if requests is None:
-        raise RuntimeError("requests chưa được cài. Chạy pip install requests hoặc dùng --input_dir.")
-    ensure_dir(out_dir)
-    queries = queries or DEFAULT_COMMONS_QUERIES
-    session = requests.Session()
-    session.headers.update({"User-Agent": "PalmistryStrictAutoDatasetBuilder/1.1 (local research; contact: local)"})
-    downloaded: List[Path] = []
-    seen_urls = set()
-    seen_titles = set()
-    meta_path = out_dir.parent / "metadata" / "commons_metadata.jsonl"
-    ensure_dir(meta_path.parent)
-    search_queries = []
-    for q in queries:
-        search_queries.append(q)
-    search_queries += [
-        "palm hand", "open palm", "human palm", "palmar crease", "hand lines",
-        "left palm", "right palm", "palmistry", "palm close up", "open hand"
-    ]
-    categories = [
-        "Category:Palms of hands",
-        "Category:Human hands",
-        "Category:Hands",
-        "Category:Palmistry",
-        "Category:Palmar creases"
-    ]
-    def save_page(page: Dict[str, Any], source: str, meta_f) -> bool:
-        nonlocal downloaded
-        title = page.get("title", "")
-        if title in seen_titles:
-            return False
-        seen_titles.add(title)
-        info_list = page.get("imageinfo") or []
-        if not info_list:
-            return False
-        info = info_list[0]
-        url = info.get("url")
-        mime = info.get("mime", "")
-        width = int(info.get("width") or 0)
-        height = int(info.get("height") or 0)
-        if not url or url in seen_urls:
-            return False
-        seen_urls.add(url)
-        if not mime.startswith("image/"):
-            return False
-        if width < 512 or height < 512:
-            return False
-        ext = Path(url.split("?")[0]).suffix.lower()
-        if ext not in IMAGE_EXTS:
-            ext = ".jpg"
-        fname = safe_name(title if title else url) + ext
-        dst = out_dir / fname
-        if dst.exists():
-            return False
-        try:
-            img_resp = session.get(url, timeout=30, stream=True)
-            if img_resp.status_code != 200:
-                return False
-            with open(dst, "wb") as f:
-                for chunk in img_resp.iter_content(chunk_size=1 << 16):
-                    if chunk:
-                        f.write(chunk)
-            if imread_rgb(dst) is None:
-                dst.unlink(missing_ok=True)
-                return False
-            meta_f.write(json.dumps({"source": source, "title": title, "url": url, "width": width, "height": height, "mime": mime}, ensure_ascii=False) + "\n")
-            downloaded.append(dst)
-            time.sleep(sleep)
-            return True
-        except Exception:
-            try:
-                dst.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return False
-    def run_query(params: Dict[str, Any], source: str, meta_f) -> None:
-        cont = None
-        attempts = 0
-        while len(downloaded) < target_count and len(seen_urls) < max_downloads and attempts < 200:
-            attempts += 1
-            req = dict(params)
-            if cont:
-                req.update(cont)
-            try:
-                r = session.get("https://commons.wikimedia.org/w/api.php", params=req, timeout=25)
-                if r.status_code != 200:
-                    break
-                data = r.json()
-            except Exception:
-                break
-            pages = data.get("query", {}).get("pages", {})
-            if pages:
-                for _, page in pages.items():
-                    if len(downloaded) >= target_count or len(seen_urls) >= max_downloads:
-                        break
-                    save_page(page, source, meta_f)
-            cont = data.get("continue")
-            if not cont:
-                break
-    with open(meta_path, "a", encoding="utf-8") as meta_f:
-        for q in search_queries:
-            if len(downloaded) >= target_count or len(seen_urls) >= max_downloads:
-                break
-            params = {
-                "action": "query",
-                "generator": "search",
-                "gsrsearch": q,
-                "gsrnamespace": 6,
-                "gsrlimit": 50,
-                "prop": "imageinfo",
-                "iiprop": "url|mime|size|extmetadata",
-                "format": "json",
-            }
-            print(f"Commons search: {q}")
-            run_query(params, f"search:{q}", meta_f)
-        for cat in categories:
-            if len(downloaded) >= target_count or len(seen_urls) >= max_downloads:
-                break
-            params = {
-                "action": "query",
-                "generator": "categorymembers",
-                "gcmtitle": cat,
-                "gcmnamespace": 6,
-                "gcmlimit": 50,
-                "prop": "imageinfo",
-                "iiprop": "url|mime|size|extmetadata",
-                "format": "json",
-            }
-            print(f"Commons category: {cat}")
-            run_query(params, f"category:{cat}", meta_f)
-    return downloaded
+    raise RuntimeError("Remote dataset download is disabled. Supply a documented local --input_dir.")
+
 
 def split_rows(rows: List[Dict[str, Any]], seed: int = 42) -> List[Dict[str, Any]]:
-    random.Random(seed).shuffle(rows)
-    n = len(rows)
-    n_train = int(n * 0.80)
-    n_val = int(n * 0.10)
-    for i, row in enumerate(rows):
-        if i < n_train:
-            row["split"] = "train"
-        elif i < n_train + n_val:
-            row["split"] = "val"
-        else:
-            row["split"] = "test"
-    return rows
-
+    return group_rows(rows, seed=seed)
 
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     ensure_dir(path.parent)
@@ -937,7 +766,10 @@ def build_pseudomask_dataset(input_paths: List[Path], output_dir: Path, out_size
                              min_short_side: int = 1024, blur_threshold: float = 60.0,
                              strict_line_threshold: float = 0.72, keep_threshold: float = 0.85,
                              min_good_lines: int = 2, exact_dedupe: bool = True,
-                             max_images: Optional[int] = None) -> Dict[str, Any]:
+                             max_images: Optional[int] = None, seed: int = 42) -> Dict[str, Any]:
+    validate_size(out_size)
+    if not input_paths:
+        raise ValueError("Empty input dataset: supply local images.")
     ensure_dir(output_dir)
     img_dir = ensure_dir(output_dir / "images")
     mask_dir = ensure_dir(output_dir / "masks")
@@ -950,7 +782,7 @@ def build_pseudomask_dataset(input_paths: List[Path], output_dir: Path, out_size
     rejected_counts: Dict[str, int] = {}
     if max_images:
         input_paths = input_paths[:max_images]
-    for p in tqdm(input_paths, desc="Auto pseudo-mask strict"):
+    for p in input_paths:
         rec: Dict[str, Any] = {"source_path": str(p)}
         try:
             if exact_dedupe:
@@ -982,6 +814,7 @@ def build_pseudomask_dataset(input_paths: List[Path], output_dir: Path, out_size
                 rec["accepted"] = 0; rec["reject_reason"] = diag.main_reason.lower()
                 rejected_counts[rec["reject_reason"]] = rejected_counts.get(rec["reject_reason"], 0) + 1
                 rows_all.append(rec); continue
+            rec.update({"source_group": str(p.parent), "phash": perceptual_hash(img), "sha256": sha256_file(p), "class_map_version": CLASS_VERSION, "label_provenance": "classical pseudo-label; not independent ground truth"})
             crop, sem, rep = create_strict_pseudo_mask(img, out_size=out_size, strict_line_threshold=strict_line_threshold)
             rec.update({"mask_quality_score": rep["mask_quality_score"], "main_line_count": rep["main_line_count"], "line_pixel_ratio": rep["line_pixel_ratio"], "component_count": rep["component_count"], "thumb_side": rep["thumb_side_estimate"]})
             for ln, s in rep["line_scores"].items():
@@ -992,6 +825,8 @@ def build_pseudomask_dataset(input_paths: List[Path], output_dir: Path, out_size
                 img_path = img_dir / f"{stem}.jpg"
                 mask_path = mask_dir / f"{stem}_mask.png"
                 overlay_path = overlay_dir / f"{stem}_overlay.jpg"
+                if any(x.exists() for x in (img_path, mask_path, overlay_path)):
+                    raise FileExistsError(f"Output collision: {img_path}; use a new directory.")
                 imwrite_rgb(img_path, crop)
                 imwrite_gray(mask_path, sem)
                 imwrite_rgb(overlay_path, make_overlay(crop, sem))
@@ -1016,12 +851,13 @@ def build_pseudomask_dataset(input_paths: List[Path], output_dir: Path, out_size
             rec["accepted"] = 0; rec["reject_reason"] = "exception"; rec["error"] = repr(e)
             rejected_counts["exception"] = rejected_counts.get("exception", 0) + 1
             rows_all.append(rec)
-    rows_keep = split_rows(rows_keep)
+    rows_keep = split_rows(rows_keep, seed=seed)
     write_csv(output_dir / "labels_pseudo_strict.csv", rows_keep)
     write_csv(output_dir / "labels_pseudo_strict_all.csv", rows_all)
-    with open(output_dir / "class_map.json", "w", encoding="utf-8") as f:
-        json.dump(CLASS_MAP, f, ensure_ascii=False, indent=2)
+    write_class_map(output_dir)
     summary = {
+        "split_counts": split_summary(rows_keep),
+        "label_provenance": "classical CV pseudo-labels; pipeline mechanics only",
         "total_input": len(input_paths),
         "accepted": len(rows_keep),
         "rejected": len(rows_all) - len(rows_keep),
@@ -1038,383 +874,364 @@ def build_pseudomask_dataset(input_paths: List[Path], output_dir: Path, out_size
 
 
 def create_eda(output_dir: Path, rows_keep: List[Dict[str, Any]], rows_all: List[Dict[str, Any]]) -> None:
+    """Write EDA tables using the standard csv module; plotting is optional UI work."""
     report_dir = ensure_dir(output_dir / "reports" / "eda")
     if not rows_all:
         return
-    # Simple CSV count by reason.
     counts: Dict[str, int] = {}
-    for r in rows_all:
-        reason = r.get("reject_reason") or "accepted"
+    for row in rows_all:
+        reason = row.get("reject_reason") or "accepted"
         counts[reason] = counts.get(reason, 0) + 1
-    with open(report_dir / "rejected_counts.json", "w", encoding="utf-8") as f:
-        json.dump(counts, f, ensure_ascii=False, indent=2)
-    if pd is not None:
-        pd.DataFrame(rows_all).to_csv(report_dir / "image_metrics_all.csv", index=False)
-        pd.DataFrame(rows_keep).to_csv(report_dir / "image_metrics_accepted.csv", index=False)
-    if plt is None:
+    write_json(report_dir / "rejected_counts.json", counts)
+    write_csv(report_dir / "image_metrics_all.csv", rows_all)
+    write_csv(report_dir / "image_metrics_accepted.csv", rows_keep)
+    sample_paths = [output_dir / row["overlay_path"] for row in rows_keep[:25] if row.get("overlay_path")]
+    images = []
+    for sample_path in sample_paths:
+        image = imread_rgb(sample_path)
+        if image is not None:
+            images.append(cv2.resize(image, (220, 220)))
+    if images:
+        cols = 5
+        rows = math.ceil(len(images) / cols)
+        canvas = np.zeros((rows * 220, cols * 220, 3), dtype=np.uint8)
+        for index, image in enumerate(images):
+            y = (index // cols) * 220
+            x = (index % cols) * 220
+            canvas[y:y + 220, x:x + 220] = image
+        imwrite_rgb(report_dir / "sample_overlay_grid.jpg", canvas)
+
+# NumPy model/training
+# -------------------
+# Project policy: model training and inference use NumPy only.  No PyTorch,
+# scikit-learn, TensorFlow or other ML framework is imported here.
+TORCH_AVAILABLE = False  # retained only so old callers fail closed
+NUMPY_MODEL_AVAILABLE = True
+MODEL_FEATURE_NAMES = (
+    "red", "green", "blue", "gray", "saturation", "blackhat", "gradient", "x", "y",
+)
+MODEL_FRAMEWORK = "NumPy diagonal-Gaussian pixel classifier"
+
+
+def _model_features(image: np.ndarray) -> np.ndarray:
+    """Build deterministic per-pixel colour, line-response and position features."""
+    if image is None or image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("Model features require an RGB image.")
+    h, w = image.shape[:2]
+    rgb = image.astype(np.float32) / 255.0
+    gray_u8 = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    gray = gray_u8.astype(np.float32) / 255.0
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
+    saturation = hsv[..., 1] / 255.0
+    blackhat_u8 = cv2.morphologyEx(
+        gray_u8,
+        cv2.MORPH_BLACKHAT,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+    )
+    blackhat = blackhat_u8.astype(np.float32) / 255.0
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    gradient = np.sqrt(gx * gx + gy * gy).clip(0.0, 1.0)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    x = xx / max(w - 1, 1)
+    y = yy / max(h - 1, 1)
+    return np.stack(
+        [rgb[..., 0], rgb[..., 1], rgb[..., 2], gray, saturation, blackhat, gradient, x, y],
+        axis=-1,
+    ).astype(np.float32)
+
+
+class NumpyPixelModel:
+    """Small, inspectable segmentation model fitted from pixel statistics.
+
+    Each class stores a diagonal Gaussian in the engineered feature space.  The
+    model is trained and evaluated with NumPy and saved as a compressed .npz;
+    this keeps the checkpoint portable and avoids executable/pickle formats.
+    """
+
+    def __init__(self, means, stds, priors, input_size, metadata=None):
+        self.means = np.asarray(means, dtype=np.float32)
+        self.stds = np.maximum(np.asarray(stds, dtype=np.float32), 1e-3)
+        self.priors = np.maximum(np.asarray(priors, dtype=np.float32), 1e-8)
+        self.priors = self.priors / float(self.priors.sum())
+        self.input_size = validate_size(int(input_size))
+        self.metadata = dict(metadata or {})
+        self.prototype_training_provenance = self.metadata.get("run_info", {})
+        counts = self.metadata.get("class_sample_counts")
+        self.learned_classes = np.asarray(counts, dtype=np.float64) > 0 if counts is not None else np.ones(len(CLASS_MAP), dtype=bool)
+        if self.learned_classes.shape != (len(CLASS_MAP),) or not self.learned_classes.any():
+            raise ValueError("Invalid/missing learned-class support in checkpoint.")
+        if self.means.shape != (len(CLASS_MAP), len(MODEL_FEATURE_NAMES)):
+            raise ValueError("Invalid NumPy model means shape.")
+        if self.stds.shape != self.means.shape or self.priors.shape != (len(CLASS_MAP),):
+            raise ValueError("Invalid NumPy model checkpoint shapes.")
+
+    def predict_proba(self, image: np.ndarray) -> np.ndarray:
+        resized = cv2.resize(image, (self.input_size, self.input_size), interpolation=cv2.INTER_AREA)
+        features = _model_features(resized)
+        delta = (features[..., None, :] - self.means[None, None, :, :]) / self.stds[None, None, :, :]
+        logits = -0.5 * np.sum(delta * delta, axis=-1)
+        logits += np.log(self.priors)[None, None, :]
+        logits -= np.sum(np.log(self.stds), axis=1)[None, None, :]
+        logits[..., ~self.learned_classes] = -np.inf
+        logits -= np.max(logits, axis=-1, keepdims=True)
+        probs = np.exp(np.clip(logits, -80.0, 40.0))
+        probs[..., ~self.learned_classes] = 0.0
+        probs /= np.maximum(np.sum(probs, axis=-1, keepdims=True), 1e-8)
+        return probs.transpose(2, 0, 1).astype(np.float32)
+
+    def predict_mask(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        probs = self.predict_proba(image)
+        return np.argmax(probs, axis=0).astype(np.uint8), probs
+
+
+def _save_numpy_checkpoint(path: Path, model: NumpyPixelModel, metadata: Dict[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    payload = dict(metadata)
+    if "class_sample_counts" in model.metadata:
+        payload["class_sample_counts"] = model.metadata["class_sample_counts"]
+    payload.setdefault("class_map", {str(k): v for k, v in CLASS_MAP.items()})
+    payload.setdefault("class_map_version", CLASS_VERSION)
+    payload.setdefault("model_version", MODEL_VERSION)
+    payload.setdefault("framework", MODEL_FRAMEWORK)
+    np.savez_compressed(
+        str(tmp),
+        means=model.means.astype(np.float32),
+        stds=model.stds.astype(np.float32),
+        priors=model.priors.astype(np.float32),
+        metadata=np.asarray(json.dumps(payload, ensure_ascii=False, sort_keys=True)),
+    )
+    generated = Path(str(tmp) + ".npz")
+    if generated != path:
+        os.replace(generated, path)
+    else:
+        os.replace(tmp, path)
+
+
+def _load_resized_pair(data_root: Path, row: Dict[str, Any], input_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    image = imread_rgb(data_root / str(row["image_path"]))
+    mask = cv2.imread(str(data_root / str(row["mask_path"])), cv2.IMREAD_UNCHANGED)
+    if image is None or mask is None:
+        raise RuntimeError(f"Cannot read training row: {row}")
+    validate_mask(mask, image.shape[:2])
+    image = cv2.resize(image, (input_size, input_size), interpolation=cv2.INTER_AREA)
+    mask = cv2.resize(mask, (input_size, input_size), interpolation=cv2.INTER_NEAREST)
+    validate_mask(mask, image.shape[:2])
+    return image, mask.astype(np.uint8)
+
+
+def _fit_numpy_model(data_root: Path, rows: List[Dict[str, Any]], input_size: int, seed: int, max_pixels_per_class: int = 6000) -> NumpyPixelModel:
+    feature_count = len(MODEL_FEATURE_NAMES)
+    sums = np.zeros((len(CLASS_MAP), feature_count), dtype=np.float64)
+    squares = np.zeros_like(sums)
+    counts = np.zeros(len(CLASS_MAP), dtype=np.int64)
+    rng = np.random.default_rng(seed)
+    for row in rows:
+        image, mask = _load_resized_pair(data_root, row, input_size)
+        features = _model_features(image).reshape(-1, feature_count)
+        labels = mask.reshape(-1)
+        for class_id in range(len(CLASS_MAP)):
+            indexes = np.flatnonzero(labels == class_id)
+            if indexes.size == 0:
+                continue
+            if indexes.size > max_pixels_per_class:
+                indexes = rng.choice(indexes, size=max_pixels_per_class, replace=False)
+            values = features[indexes].astype(np.float64)
+            sums[class_id] += values.sum(axis=0)
+            squares[class_id] += np.square(values).sum(axis=0)
+            counts[class_id] += values.shape[0]
+    if not np.any(counts):
+        raise ValueError("No valid pixels found for NumPy model training.")
+    global_mean = sums.sum(axis=0) / max(float(counts.sum()), 1.0)
+    global_var = np.maximum(squares.sum(axis=0) / max(float(counts.sum()), 1.0) - global_mean * global_mean, 0.0)
+    means = np.zeros_like(sums, dtype=np.float32)
+    stds = np.zeros_like(sums, dtype=np.float32)
+    for class_id in range(len(CLASS_MAP)):
+        if counts[class_id] > 0:
+            means[class_id] = sums[class_id] / counts[class_id]
+            variance = np.maximum(squares[class_id] / counts[class_id] - means[class_id] ** 2, 0.0)
+            stds[class_id] = np.sqrt(variance).astype(np.float32)
+        else:
+            means[class_id] = global_mean
+            stds[class_id] = np.sqrt(global_var).astype(np.float32)
+    # A square-root prior prevents background pixels from overwhelming rare lines.
+    priors = np.sqrt(counts.astype(np.float32) + 1.0)
+    priors /= float(priors.sum())
+    stds = np.maximum(stds, 0.025)
+    return NumpyPixelModel(
+        means,
+        stds,
+        priors,
+        input_size,
+        {"class_sample_counts": counts.tolist(), "feature_names": list(MODEL_FEATURE_NAMES)},
+    )
+
+
+class PalmMaskDataset:
+    """Compatibility reader exposing manifest rows without a tensor framework."""
+
+    def __init__(self, data_root: Path, labels_csv: Path, split: str, input_size: int = 512, augment: bool = False):
+        if augment and split != "train":
+            raise ValueError("Validation/test augmentation is forbidden.")
+        self.data_root = Path(data_root)
+        self.input_size = validate_size(input_size)
+        self.rows = [row for row in read_manifest(self.data_root, labels_csv) if row["split"] == split]
+
+    def __len__(self):
+        return len(self.rows)
+
+    def _load(self, row):
+        return _load_resized_pair(self.data_root, row, self.input_size)
+
+    def __getitem__(self, index):
+        return self._load(self.rows[index])
+
+
+def compute_dice_metrics(prediction, target, num_classes=len(CLASS_MAP)) -> Dict[str, float]:
+    pred = np.asarray(prediction)
+    target = np.asarray(target)
+    if pred.ndim == 4:
+        pred = np.argmax(pred, axis=1)
+    if target.ndim == 4:
+        target = np.argmax(target, axis=1)
+    if pred.ndim == 2:
+        pred = pred[None, ...]
+    if target.ndim == 2:
+        target = target[None, ...]
+    out = {}
+    for class_id in range(1, num_classes):
+        p = pred == class_id
+        t = target == class_id
+        denom = int(p.sum() + t.sum())
+        out[f"dice_{CLASS_MAP[class_id]}"] = float(2 * np.logical_and(p, t).sum() / denom) if denom else 0.0
+    out["dice_main_lines_mean"] = float(np.mean([out.get("dice_life_line", 0.0), out.get("dice_head_line", 0.0), out.get("dice_heart_line", 0.0)]))
+    return out
+
+
+def _evaluate_numpy_model(model: NumpyPixelModel, data_root: Path, rows: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], np.ndarray]:
+    cm = np.zeros((len(CLASS_MAP), len(CLASS_MAP)), dtype=np.int64)
+    for row in rows:
+        image, target = _load_resized_pair(data_root, row, model.input_size)
+        prediction, _ = model.predict_mask(image)
+        cm += confusion_matrix(prediction, target)
+    return metrics_from_confusion(cm), cm
+
+
+def _write_history_csv(path: Path, history: List[Dict[str, Any]]) -> None:
+    if not history:
         return
-    try:
-        def hist(key: str, fname: str, title: str):
-            vals = [float(r[key]) for r in rows_all if key in r and str(r[key]) not in ("", "nan")]
-            if not vals: return
-            plt.figure(figsize=(7,4))
-            plt.hist(vals, bins=40)
-            plt.title(title)
-            plt.xlabel(key); plt.ylabel("count")
-            plt.tight_layout(); plt.savefig(report_dir / fname); plt.close()
-        hist("measure_laplacian_variance", "blur_laplacian_hist.png", "Blur/Laplacian variance")
-        hist("diag_image_quality_score", "image_quality_hist.png", "Image quality score")
-        hist("mask_quality_score", "mask_quality_hist.png", "Mask quality score")
-        hist("line_pixel_ratio", "line_pixel_ratio_hist.png", "Line pixel ratio")
-        plt.figure(figsize=(8,4))
-        plt.bar(list(counts.keys()), list(counts.values()))
-        plt.xticks(rotation=45, ha="right")
-        plt.title("Accepted/rejected counts")
-        plt.tight_layout(); plt.savefig(report_dir / "accepted_rejected_counts.png"); plt.close()
-        # Sample grid
-        sample_paths = [output_dir / r["overlay_path"] for r in rows_keep[:25] if r.get("overlay_path")]
-        imgs = []
-        for sp in sample_paths:
-            im = imread_rgb(sp)
-            if im is not None:
-                imgs.append(cv2.resize(im, (220,220)))
-        if imgs:
-            cols = 5; rows = math.ceil(len(imgs)/cols)
-            canvas = np.zeros((rows*220, cols*220, 3), dtype=np.uint8)
-            for i, im in enumerate(imgs):
-                y = (i//cols)*220; x=(i%cols)*220
-                canvas[y:y+220, x:x+220] = im
-            imwrite_rgb(report_dir / "sample_overlay_grid.jpg", canvas)
-    except Exception:
-        pass
-
-# -----------------------------
-# PyTorch model/training
-# -----------------------------
-if TORCH_AVAILABLE:
-    class PalmMaskDataset(Dataset):
-        def __init__(self, data_root: Path, labels_csv: Path, split: str, input_size: int = 512, augment: bool = False):
-            self.data_root = Path(data_root)
-            self.input_size = input_size
-            self.augment = augment
-            rows = []
-            if pd is not None:
-                df = pd.read_csv(labels_csv)
-                rows = df.to_dict("records")
-            else:
-                with open(labels_csv, newline="", encoding="utf-8") as f:
-                    rows = list(csv.DictReader(f))
-            self.rows = [r for r in rows if str(r.get("split", "train")) == split]
-            if not self.rows and split == "train":
-                self.rows = rows
-        def __len__(self): return len(self.rows)
-        def _load(self, r):
-            img = imread_rgb(self.data_root / str(r["image_path"]))
-            mask = cv2.imread(str(self.data_root / str(r["mask_path"])), cv2.IMREAD_UNCHANGED)
-            if img is None or mask is None:
-                raise RuntimeError(f"Cannot read {r}")
-            img = cv2.resize(img, (self.input_size, self.input_size), interpolation=cv2.INTER_AREA)
-            mask = cv2.resize(mask, (self.input_size, self.input_size), interpolation=cv2.INTER_NEAREST)
-            return img, mask.astype(np.int64)
-        def __getitem__(self, idx):
-            img, mask = self._load(self.rows[idx])
-            if self.augment:
-                img, mask = augment_image_mask(img, mask)
-            x = torch.from_numpy(img.transpose(2,0,1)).float() / 255.0
-            mean = torch.tensor([0.485,0.456,0.406])[:,None,None]
-            std = torch.tensor([0.229,0.224,0.225])[:,None,None]
-            x = (x - mean) / std
-            y = torch.from_numpy(mask).long()
-            return x, y
-
-    def augment_image_mask(img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        h, w = img.shape[:2]
-        # flip horizontal with class unchanged, because canonical direction is not guaranteed in auto dataset.
-        if random.random() < 0.5:
-            img = np.ascontiguousarray(img[:, ::-1])
-            mask = np.ascontiguousarray(mask[:, ::-1])
-        angle = random.uniform(-10, 10)
-        scale = random.uniform(0.92, 1.08)
-        tx = random.uniform(-0.04, 0.04) * w
-        ty = random.uniform(-0.04, 0.04) * h
-        M = cv2.getRotationMatrix2D((w/2,h/2), angle, scale)
-        M[:,2] += [tx, ty]
-        img = cv2.warpAffine(img, M, (w,h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0))
-        mask = cv2.warpAffine(mask, M, (w,h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        # photometric jitter
-        if random.random() < 0.75:
-            alpha = random.uniform(0.85, 1.18)
-            beta = random.uniform(-18, 18)
-            img = np.clip(img.astype(np.float32)*alpha + beta, 0, 255).astype(np.uint8)
-        if random.random() < 0.35:
-            noise = np.random.normal(0, random.uniform(1, 5), img.shape).astype(np.float32)
-            img = np.clip(img.astype(np.float32)+noise, 0, 255).astype(np.uint8)
-        if random.random() < 0.15:
-            k = random.choice([3,5])
-            img = cv2.GaussianBlur(img, (k,k), 0)
-        return img, mask
-
-    class ConvBlock(nn.Module):
-        def __init__(self, in_ch, out_ch, dropout=0.0):
-            super().__init__()
-            self.block = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-            )
-        def forward(self, x): return self.block(x)
-
-    class SmallUNet(nn.Module):
-        def __init__(self, num_classes=6, base=32, dropout=0.15):
-            super().__init__()
-            self.enc1 = ConvBlock(3, base, dropout=0.0)
-            self.enc2 = ConvBlock(base, base*2, dropout=dropout/2)
-            self.enc3 = ConvBlock(base*2, base*4, dropout=dropout)
-            self.enc4 = ConvBlock(base*4, base*8, dropout=dropout)
-            self.pool = nn.MaxPool2d(2)
-            self.bottleneck = ConvBlock(base*8, base*16, dropout=dropout)
-            self.up4 = nn.ConvTranspose2d(base*16, base*8, 2, stride=2)
-            self.dec4 = ConvBlock(base*16, base*8, dropout=dropout)
-            self.up3 = nn.ConvTranspose2d(base*8, base*4, 2, stride=2)
-            self.dec3 = ConvBlock(base*8, base*4, dropout=dropout)
-            self.up2 = nn.ConvTranspose2d(base*4, base*2, 2, stride=2)
-            self.dec2 = ConvBlock(base*4, base*2, dropout=dropout/2)
-            self.up1 = nn.ConvTranspose2d(base*2, base, 2, stride=2)
-            self.dec1 = ConvBlock(base*2, base, dropout=0.0)
-            self.out = nn.Conv2d(base, num_classes, 1)
-        def forward(self, x):
-            e1 = self.enc1(x)
-            e2 = self.enc2(self.pool(e1))
-            e3 = self.enc3(self.pool(e2))
-            e4 = self.enc4(self.pool(e3))
-            b = self.bottleneck(self.pool(e4))
-            d4 = self.dec4(torch.cat([self.up4(b), e4], dim=1))
-            d3 = self.dec3(torch.cat([self.up3(d4), e3], dim=1))
-            d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
-            d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-            return self.out(d1)
-
-    def dice_loss(logits, target, num_classes=6, ignore_background=True, eps=1e-6):
-        probs = torch.softmax(logits, dim=1)
-        onehot = F.one_hot(target.clamp(0, num_classes-1), num_classes).permute(0,3,1,2).float()
-        start = 1 if ignore_background else 0
-        dices = []
-        for c in range(start, num_classes):
-            p = probs[:, c]
-            t = onehot[:, c]
-            inter = (p*t).sum(dim=(1,2))
-            denom = p.sum(dim=(1,2)) + t.sum(dim=(1,2)) + eps
-            dices.append(1 - ((2*inter + eps) / denom))
-        return torch.stack(dices, dim=1).mean()
-
-    @torch.no_grad()
-    def compute_dice_metrics(logits, target, num_classes=6) -> Dict[str, float]:
-        pred = torch.argmax(logits, dim=1)
-        out = {}
-        for c in range(1, num_classes):
-            p = (pred == c).float()
-            t = (target == c).float()
-            inter = (p*t).sum().item()
-            denom = p.sum().item() + t.sum().item()
-            dice = (2*inter + 1e-6) / (denom + 1e-6)
-            out[f"dice_{CLASS_MAP[c]}"] = float(dice)
-        line_dices = [out.get("dice_life_line",0), out.get("dice_head_line",0), out.get("dice_heart_line",0)]
-        out["dice_main_lines_mean"] = float(np.mean(line_dices))
-        return out
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(history[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(history)
 
 
 def train_model(args: argparse.Namespace) -> Dict[str, Any]:
-    if not TORCH_AVAILABLE:
-        raise RuntimeError("PyTorch chưa được cài. Chạy pip install torch torchvision")
+    validate_parameters(args)
+    seed_everything(args.seed)
     data_root = Path(args.data_root)
     labels_csv = Path(args.labels_csv)
     out_dir = ensure_dir(Path(args.out_dir))
     ckpt_dir = ensure_dir(out_dir / "checkpoints")
     log_dir = ensure_dir(out_dir / "logs")
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    train_ds = PalmMaskDataset(data_root, labels_csv, "train", args.input_size, augment=True)
-    val_ds = PalmMaskDataset(data_root, labels_csv, "val", args.input_size, augment=False)
-    if len(val_ds) == 0:
-        print("Không có split val; dùng 10% train làm val tạm.")
-        val_ds = train_ds
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=(device.type=="cuda"))
-    val_loader = DataLoader(val_ds, batch_size=max(1, args.batch_size), shuffle=False, num_workers=args.num_workers, pin_memory=(device.type=="cuda"))
-    base = 24 if args.model_size == "tiny" else 32 if args.model_size == "small" else 48
-    model = SmallUNet(num_classes=6, base=base, dropout=args.dropout).to(device)
-    class_weights = torch.tensor([0.10, 0.35, 2.4, 2.4, 2.4, 1.2], dtype=torch.float32, device=device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.amp))
-    start_epoch = 0; best_metric = -1.0; history = []
-    last_ckpt = ckpt_dir / "last.pt"
-    best_ckpt = ckpt_dir / "best.pt"
-    if args.resume == "auto" and last_ckpt.exists():
-        ck = torch.load(last_ckpt, map_location=device)
-        model.load_state_dict(ck["model"])
-        opt.load_state_dict(ck["optimizer"])
-        if "scaler" in ck and ck["scaler"] is not None:
-            try: scaler.load_state_dict(ck["scaler"])
-            except Exception: pass
-        start_epoch = int(ck.get("epoch", 0)) + 1
-        best_metric = float(ck.get("best_metric", -1.0))
-        history = ck.get("history", [])
-        print(f"Resume từ epoch {start_epoch}, best={best_metric:.4f}")
-    start_time = time.time()
-    max_seconds = args.max_train_hours * 3600 if args.max_train_hours else None
-    no_improve = 0
-    for epoch in range(start_epoch, args.epochs):
-        model.train(); opt.zero_grad(set_to_none=True)
-        train_loss = 0.0; steps = 0
-        for step, (x, y) in enumerate(tqdm(train_loader, desc=f"epoch {epoch}")):
-            x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda" and args.amp)):
-                logits = model(x)
-                ce = F.cross_entropy(logits, y, weight=class_weights)
-                dl = dice_loss(logits, y, num_classes=6)
-                loss = (ce + args.dice_weight * dl) / args.grad_accum
-            scaler.scale(loss).backward()
-            if (step + 1) % args.grad_accum == 0:
-                if args.grad_clip > 0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
-            train_loss += float(loss.item()) * args.grad_accum; steps += 1
-            if max_seconds and (time.time() - start_time) > max_seconds * 0.98:
-                print("Gần hết thời gian train, lưu checkpoint và dừng an toàn.")
-                break
-        # Validation
-        model.eval(); metrics_accum: Dict[str, List[float]] = {}; val_loss = 0.0; nval = 0
-        with torch.no_grad():
-            for x, y in tqdm(val_loader, desc="val"):
-                x = x.to(device); y = y.to(device)
-                logits = model(x)
-                ce = F.cross_entropy(logits, y, weight=class_weights)
-                dl = dice_loss(logits, y, num_classes=6)
-                loss = ce + args.dice_weight * dl
-                val_loss += float(loss.item()); nval += 1
-                md = compute_dice_metrics(logits, y)
-                for k, v in md.items(): metrics_accum.setdefault(k, []).append(v)
-        metrics = {k: float(np.mean(v)) for k, v in metrics_accum.items()}
-        metric = metrics.get("dice_main_lines_mean", 0.0)
-        row = {"epoch": epoch, "train_loss": train_loss/max(steps,1), "val_loss": val_loss/max(nval,1), **metrics}
-        history.append(row)
-        print(json.dumps(row, ensure_ascii=False, indent=2))
-        if pd is not None:
-            pd.DataFrame(history).to_csv(log_dir / "history.csv", index=False)
-        with open(log_dir / "history.json", "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-        improved = metric > best_metric
-        if improved:
-            best_metric = metric; no_improve = 0
-        else:
-            no_improve += 1
-        ck = {
-            "model": model.state_dict(), "optimizer": opt.state_dict(),
-            "scaler": scaler.state_dict() if scaler is not None else None,
-            "epoch": epoch, "best_metric": best_metric, "history": history,
-            "class_map": CLASS_MAP, "input_size": args.input_size,
-            "model_size": args.model_size, "base": base,
-            "validation_scores": metrics,
-        }
-        torch.save(ck, last_ckpt)
-        if improved:
-            torch.save(ck, best_ckpt)
-            with open(out_dir / "class_validation_scores.json", "w", encoding="utf-8") as f:
-                json.dump(metrics, f, ensure_ascii=False, indent=2)
-        if no_improve >= args.patience:
-            print("Early stopping.")
-            break
-        if max_seconds and (time.time() - start_time) > max_seconds * 0.98:
-            break
-    return {"best_metric": best_metric, "history": history}
+    input_size = validate_size(int(args.input_size))
+    audited_rows = read_manifest(data_root, labels_csv)
+    train_rows = [row for row in audited_rows if row["split"] == "train"]
+    val_rows = [row for row in audited_rows if row["split"] == "val"]
+    if not train_rows or not val_rows:
+        raise ValueError("Non-empty independent train and val splits required.")
+    run_info = provenance(args, labels_csv)
+    run_info["split_counts"] = split_summary(audited_rows)
+    run_info["label_provenance"] = sorted({str(row.get("label_provenance") or row.get("cls_quality") or "unverified annotations") for row in audited_rows})
+    run_info["evaluation_scope"] = "fixture-only" if all("deterministic test fixture" in value for value in run_info["label_provenance"]) else "annotation/pseudo-label mechanics; no independent accuracy claim"
+    run_info["framework"] = MODEL_FRAMEWORK
+    run_info["model_version"] = MODEL_VERSION
+    run_info["device"] = "cpu"
+    write_json(out_dir / "run_config.json", run_info)
+    model = _fit_numpy_model(data_root, train_rows, input_size, int(args.seed), int(getattr(args, "max_pixels_per_class", 6000)))
+    model.metadata.update({"run_info": run_info, "input_size": input_size})
+    detailed, _ = _evaluate_numpy_model(model, data_root, val_rows)
+    metrics = {f"dice_{name}": values["dice"] for name, values in detailed["per_class"].items()}
+    metric_values = [float(metrics.get(f"dice_{name}")) for name in LINE_CLASSES.values() if metrics.get(f"dice_{name}") is not None]
+    metric = float(np.mean(metric_values)) if metric_values else 0.0
+    metrics["dice_main_lines_mean"] = metric
+    write_json(log_dir / "validation_metrics.json", {"split": "val", "provenance": run_info, **detailed})
+    history = [{"epoch": 0, "train_loss": 0.0, "val_loss": 0.0, **metrics}]
+    _write_history_csv(log_dir / "history.csv", history)
+    write_json(log_dir / "history.json", history)
+    checkpoint_meta = {
+        "class_map": {str(k): v for k, v in CLASS_MAP.items()},
+        "class_map_version": CLASS_VERSION,
+        "model_version": MODEL_VERSION,
+        "framework": MODEL_FRAMEWORK,
+        "input_size": input_size,
+        "validation_scores": metrics,
+        "run_info": run_info,
+        "epochs_requested": int(args.epochs),
+        "training_method": "deterministic diagonal Gaussian class statistics over engineered pixels",
+    }
+    best_checkpoint = ckpt_dir / "best.npz"
+    last_checkpoint = ckpt_dir / "last.npz"
+    _save_numpy_checkpoint(last_checkpoint, model, checkpoint_meta)
+    _save_numpy_checkpoint(best_checkpoint, model, checkpoint_meta)
+    (ckpt_dir / "last.npz.sha256").write_text(sha256_file(last_checkpoint), encoding="ascii")
+    (ckpt_dir / "best.npz.sha256").write_text(sha256_file(best_checkpoint), encoding="ascii")
+    write_json(out_dir / "class_validation_scores.json", metrics)
+    return {"best_metric": metric, "history": history, "framework": MODEL_FRAMEWORK, "checkpoint": str(best_checkpoint)}
 
-# -----------------------------
+
+def finish_partial_accumulation(*_args, **_kwargs):
+    # Kept as a no-op compatibility hook for callers of the old trainer.
+    return None
+
+
+def safe_checkpoint(checkpoint, device=None, expected_sha256=""):
+    from prototype_common import validate_npz_size
+    checkpoint = Path(checkpoint)
+    if not expected_sha256 or len(str(expected_sha256)) != 64:
+        raise ValueError("Checkpoint requires explicit --checkpoint-sha256 from a trusted source.")
+    if checkpoint.stat().st_size > 512 * 1024 * 1024:
+        raise ValueError("Checkpoint exceeds prototype 512 MiB limit.")
+    if sha256_file(checkpoint).lower() != str(expected_sha256).lower():
+        raise ValueError("Checkpoint SHA-256 mismatch.")
+    if checkpoint.suffix.lower() != ".npz":
+        raise ValueError("Only NumPy .npz checkpoints are supported by this project.")
+    validate_npz_size(checkpoint, 512 * 1024 * 1024)
+    try:
+        with np.load(checkpoint, allow_pickle=False) as payload:
+            metadata = json.loads(str(payload["metadata"].item()))
+            means = np.asarray(payload["means"], dtype=np.float32)
+            stds = np.asarray(payload["stds"], dtype=np.float32)
+            priors = np.asarray(payload["priors"], dtype=np.float32)
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid NumPy checkpoint: {exc}") from exc
+    expected_map = {str(k): v for k, v in CLASS_MAP.items()}
+    if not isinstance(metadata, dict) or metadata.get("class_map") != expected_map or metadata.get("class_map_version") != CLASS_VERSION or metadata.get("model_version") != MODEL_VERSION:
+        raise ValueError("Incompatible checkpoint schema, class map or model version.")
+    validate_size(int(metadata.get("input_size")))
+    return {"means": means, "stds": stds, "priors": priors, "metadata": metadata}
+
+
+def load_model_for_predict(checkpoint: Path, device=None, expected_sha256=""):
+    ck = safe_checkpoint(checkpoint, device, expected_sha256)
+    metadata = ck["metadata"]
+    model = NumpyPixelModel(ck["means"], ck["stds"], ck["priors"], metadata["input_size"], metadata)
+    model.prototype_training_provenance = metadata.get("run_info", {})
+    return model, int(metadata["input_size"]), metadata.get("validation_scores", {})
+
 # Prediction and Vietnamese output
 # -----------------------------
 def line_feature_from_mask(sem: np.ndarray, cls: int) -> Dict[str, Any]:
-    m = (sem == cls).astype(np.uint8) * 255
-    if np.sum(m) == 0:
-        return {"detected": False}
-    sk = skeletonize_mask(m)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats((sk > 0).astype(np.uint8), 8)
-    comps = []
-    for i in range(1, n):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area >= 5:
-            comp = (labels == i).astype(np.uint8)
-            feat = component_features(comp)
-            if feat:
-                comps.append(feat)
-    if not comps:
-        return {"detected": False}
-    # merge summary
-    length = sum(f["length_px"] for f in comps)
-    largest = max(comps, key=lambda f: f["length_px"])
-    h, w = sem.shape
-    density = float(np.mean(m > 0))
-    # endpoints/intersections proxy from skeleton neighbors
-    sk_bin = (sk > 0).astype(np.uint8)
-    kernel = np.ones((3,3), dtype=np.uint8)
-    neigh = cv2.filter2D(sk_bin, -1, kernel)
-    endpoints = int(np.sum((sk_bin == 1) & (neigh == 2)))
-    intersections = int(np.sum((sk_bin == 1) & (neigh >= 4)))
-    return {
-        "detected": True,
-        "length_px": float(length),
-        "length_norm": float(length / max(h, w)),
-        "density": density,
-        "component_count": len(comps),
-        "largest_component_length_px": float(largest["length_px"]),
-        "cx": largest["cx"], "cy": largest["cy"],
-        "angle": largest["angle"],
-        "horizontalness": largest["horizontalness"],
-        "verticalness": largest["verticalness"],
-        "diagonalness": largest["diagonalness"],
-        "endpoint_proxy_count": endpoints,
-        "intersection_proxy_count": intersections,
-    }
+    return measure_line(sem, cls, skeletonize_mask)
 
 
 def vietnamese_reading(accepted: Dict[str, Dict[str, Any]]) -> str:
-    parts = ["KẾT QUẢ PHÂN TÍCH CHỈ TAY", ""]
-    if "life_line" in accepted:
-        f = accepted["life_line"]
-        cont = "tương đối liền mạch" if f.get("component_count", 1) <= 2 else "có vài đoạn tách nhỏ"
-        parts += [
-            "Sinh đạo:",
-            f"Sinh đạo được nhận diện rõ, độ dài tương đối {describe_length(f.get('length_norm',0))} và {cont}. Dạng này nghiêng về nền tảng sức bền ổn, khả năng hồi phục tốt và có xu hướng bám lâu với mục tiêu khi đã chọn đúng môi trường.",
-            ""
-        ]
-    if "head_line" in accepted:
-        f = accepted["head_line"]
-        direction = "thiên ngang/thực tế" if f.get("horizontalness",0) >= f.get("diagonalness",0) else "hơi xuôi chéo, thiên về trực giác/sáng tạo"
-        parts += [
-            "Trí đạo:",
-            f"Trí đạo được nhận diện rõ và {direction}. Điều này nghiêng về kiểu tư duy có khả năng phân tích, học sâu và tự xây hệ thống suy nghĩ riêng; nếu đường hơi xuôi chéo, yếu tố sáng tạo và trực giác sẽ nổi bật hơn.",
-            ""
-        ]
-    if "heart_line" in accepted:
-        f = accepted["heart_line"]
-        parts += [
-            "Tâm đạo:",
-            f"Tâm đạo được nhận diện rõ ở vùng trên lòng bàn tay, độ dài tương đối {describe_length(f.get('length_norm',0))}. Hệ đọc nghiêng về kiểu cảm xúc rõ, biết quan tâm và cần sự ổn định trong các mối quan hệ thân thiết.",
-            ""
-        ]
-    # Summary based on accepted lines
-    traits = []
-    if "head_line" in accepted: traits.append("tư duy sâu")
-    if "heart_line" in accepted: traits.append("cảm xúc rõ")
-    if "life_line" in accepted: traits.append("khả năng bền bỉ")
-    if not traits: traits = ["một số đặc điểm đủ điều kiện phân tích"]
-    parts += [
-        "Tổng hợp:",
-        "Các đường đủ điều kiện phân tích cho thấy người này nghiêng về nhóm có " + ", ".join(traits) + ". Khi có mục tiêu rõ và môi trường phù hợp, người này có khả năng phát triển ổn định hơn.",
-    ]
-    return "\n".join(parts)
-
+    return "Geometry only; no personality, health or future inference:\n" + "\n".join(
+        f"{name}: tỷ lệ so với lòng bàn tay {item.get('length_norm', 0):.3f}" for name, item in accepted.items())
 
 def describe_length(x: float) -> str:
     if x >= 0.55: return "dài"
@@ -1422,18 +1239,7 @@ def describe_length(x: float) -> str:
     return "ngắn"
 
 
-def load_model_for_predict(checkpoint: Path, device: torch.device):
-    ck = torch.load(checkpoint, map_location=device)
-    base = int(ck.get("base", 32))
-    model = SmallUNet(num_classes=6, base=base, dropout=0.0).to(device)
-    model.load_state_dict(ck["model"])
-    model.eval()
-    input_size = int(ck.get("input_size", 512))
-    val_scores = ck.get("validation_scores", {})
-    return model, input_size, val_scores
-
-
-def predict_image(args: argparse.Namespace) -> Dict[str, Any]:
+def _predict_image(args: argparse.Namespace) -> Dict[str, Any]:
     img_path = Path(args.image)
     img = imread_rgb(img_path)
     if img is None:
@@ -1441,55 +1247,48 @@ def predict_image(args: argparse.Namespace) -> Dict[str, Any]:
         return asdict(res)
     diag = analyze_quality(img, min_short_side=args.min_short_side)
     if diag.status != "ok" and diag.scores.get("image_quality_score",0) < args.min_image_quality:
-        out = asdict(diag); out["status"] = "need_retake"; save_json_if_needed(args, out); return out
+        out = asdict(diag); out["status"] = "need_retake"; return out
     crop, pseudo_sem, pseudo_report = create_strict_pseudo_mask(img, out_size=args.out_size, strict_line_threshold=args.strict_line_threshold)
     sem = pseudo_sem
     model_scores: Dict[str, Any] = {}
+    model = None
     if args.checkpoint and Path(args.checkpoint).exists():
-        if not TORCH_AVAILABLE:
-            raise RuntimeError("PyTorch chưa được cài, không thể dùng checkpoint.")
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-        model, input_size, val_scores = load_model_for_predict(Path(args.checkpoint), device)
-        inp = cv2.resize(crop, (input_size, input_size), interpolation=cv2.INTER_AREA)
-        x = torch.from_numpy(inp.transpose(2,0,1)).float()/255.0
-        mean = torch.tensor([0.485,0.456,0.406])[:,None,None]
-        std = torch.tensor([0.229,0.224,0.225])[:,None,None]
-        x = ((x-mean)/std).unsqueeze(0).to(device)
-        with torch.no_grad():
-            logits = model(x)
-            probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-            pred = np.argmax(probs, axis=0).astype(np.uint8)
-            pred = cv2.resize(pred, (args.out_size,args.out_size), interpolation=cv2.INTER_NEAREST)
-            sem = pred
-            # Mean confidence per line class.
-            for cls, name in LINE_CLASSES.items():
-                cls_mask = pred == cls
-                if np.any(cls_mask):
-                    # resize prob cls to out_size
-                    pmap = cv2.resize(probs[cls], (args.out_size,args.out_size), interpolation=cv2.INTER_LINEAR)
-                    model_scores[name] = float(np.mean(pmap[cls_mask]))
-                else:
-                    model_scores[name] = 0.0
-            model_scores["validation_scores"] = val_scores
+        model, input_size, val_scores = load_model_for_predict(Path(args.checkpoint), None, args.checkpoint_sha256)
+        probs = model.predict_proba(crop)
+        pred = np.argmax(probs, axis=0).astype(np.uint8)
+        pred = cv2.resize(pred, (args.out_size, args.out_size), interpolation=cv2.INTER_NEAREST)
+        sem = pred
+        model_scores["validation_scores"] = val_scores
+        for cls, name in LINE_CLASSES.items():
+            cls_mask = pred == cls
+            if np.any(cls_mask):
+                pmap = cv2.resize(probs[cls], (args.out_size, args.out_size), interpolation=cv2.INTER_LINEAR)
+                model_scores[name] = float(np.mean(pmap[cls_mask]))
+            else:
+                model_scores[name] = 0.0
     else:
-        # Use pseudo scores as fallback.
+        # Use deterministic classical pseudo scores as the explicit fallback.
         model_scores = dict(pseudo_report.get("line_scores", {}))
         model_scores["validation_scores"] = {}
-
+    mirrored = {"yes": True, "no": False}.get(getattr(args, "mirrored", "unknown"))
+    skin_mask, _, _ = detect_skin_largest_contour(img)
+    handedness = infer_handedness(skin_mask, mirrored=mirrored)
+    features = resolve_transverse_lines({name: line_feature_from_mask(sem, cls) for cls, name in LINE_CLASSES.items()})
     accepted: Dict[str, Dict[str, Any]] = {}
     rejected: Dict[str, Any] = {}
     for cls, name in LINE_CLASSES.items():
-        feat = line_feature_from_mask(sem, cls)
+        feat = features[name]
         pseudo_s = float(pseudo_report.get("line_scores", {}).get(name, 0.0))
         pred_s = float(model_scores.get(name, pseudo_s))
         val_scores = model_scores.get("validation_scores", {}) if isinstance(model_scores.get("validation_scores", {}), dict) else {}
         val_key = f"dice_{name}"
-        val_s = float(val_scores.get(val_key, 1.0 if not args.require_validation_scores else 0.0))
-        template_s = pseudo_s
+        raw_val = val_scores.get(val_key)
+        val_s = float(raw_val if raw_val is not None else (0.0 if args.require_validation_scores else 1.0))
+        template_s = pred_s if model is not None else pseudo_s
         length_s = normalize_score(feat.get("length_norm", 0.0), 0.10, 0.55) if feat.get("detected") else 0.0
         final = min(diag.scores.get("image_quality_score",0), diag.scores.get("line_visibility_score",0), pred_s, template_s, max(length_s, 0.35), val_s)
-        item = {"final_score": float(final), "model_score": pred_s, "template_score": template_s, "validation_score": val_s, **feat}
-        if feat.get("detected") and final >= args.read_threshold:
+        item = {"heuristic_score": float(final), "model_ranking_score": pred_s, "template_score": template_s, "validation_score": val_s, **feat}
+        if feat.get("detected") and final >= args.read_threshold and handedness["side"] != "unknown":
             accepted[name] = item
         else:
             rejected[name] = item
@@ -1518,16 +1317,72 @@ def predict_image(args: argparse.Namespace) -> Dict[str, Any]:
             "reading_vi": reading,
             "pseudo_report": pseudo_report,
         }
-    if args.out_mask:
-        imwrite_gray(Path(args.out_mask), sem)
-    if args.out_overlay:
-        imwrite_rgb(Path(args.out_overlay), make_overlay(crop, sem))
-    save_json_if_needed(args, out)
+    validate_mask(sem, crop.shape[:2])
+    out["handedness"] = handedness
+    out["measurement_version"] = "palm-geodesic-v2"
+    if handedness["side"] == "unknown":
+        out.update(main_reason="HAND_SIDE_UNCERTAIN", reason_vi="Chưa xác định chắc chắn tay trái/phải.", fix_vi="Chụp một lòng bàn tay mở, ngón hướng lên và khai báo ảnh có lật gương không.")
+    out["segmentation_available"] = True
+    out["crop_meta"] = pseudo_report["crop_meta"]
+    out["training_provenance"] = getattr(model, "prototype_training_provenance", {}) if args.checkpoint else {"labels": "classical pseudo-labels; not independent ground truth"}
+    if args.out_mask and not imwrite_gray(Path(args.out_mask), sem):
+        raise OSError("Could not write mask.")
+    if args.out_overlay and not imwrite_rgb(Path(args.out_overlay), make_overlay(crop, sem)):
+        raise OSError("Could not write overlay.")
     if args.print_reading and out.get("status") == "success":
         print(out["reading_vi"])
     elif args.print_reading:
         print(out.get("reason_vi", "Không thể phân tích ảnh này."))
         print(out.get("fix_vi", ""))
+    return out
+
+
+def predict_image(args: argparse.Namespace) -> Dict[str, Any]:
+    import uuid
+    request_id = getattr(args, "request_id", None) or uuid.uuid4().hex
+    started = time.perf_counter()
+    outputs = []
+    safe_json = False
+    try:
+        outputs = [Path(x).resolve() for x in (args.out_json, args.out_mask, args.out_overlay) if x]
+        protected = {Path(args.image).resolve()}
+        if args.checkpoint:
+            protected.add(Path(args.checkpoint).resolve())
+        if len(set(outputs)) != len(outputs) or protected.intersection(outputs):
+            outputs = []
+            raise ValueError("Output paths must be distinct and cannot overwrite input/checkpoint.")
+        safe_json = True
+        for path in outputs:
+            path.unlink(missing_ok=True)
+        validate_parameters(args)
+        if args.checkpoint and not Path(args.checkpoint).is_file():
+            raise FileNotFoundError("Explicit checkpoint does not exist; classical fallback was not substituted.")
+        if args.checkpoint and not args.checkpoint_sha256:
+            raise ValueError("An explicit trusted --checkpoint-sha256 is required.")
+        if not args.checkpoint and not args.allow_classical_fallback:
+            raise ValueError("Supply --checkpoint and --checkpoint-sha256, or explicitly --allow-classical-fallback.")
+        seed_everything(getattr(args, "seed", 42))
+        out = _predict_image(args)
+    except Exception as e:
+        for path in outputs:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        out = {"status": "error", "main_reason": type(e).__name__, "error": str(e)}
+    used = bool(args.checkpoint) and out.get("segmentation_available", False)
+    out.update({"schema_version": 1, "request_id": request_id, "model_used": used,
+                "inference_source": ("trained model" if used else "classical CV fallback") if out.get("segmentation_available") else "none",
+                "class_map_version": CLASS_VERSION, "elapsed_seconds": time.perf_counter() - started,
+                "score_semantics": "uncalibrated heuristic ranking; not probability",
+                "provenance": provenance(args)})
+    out["success_marker"] = request_id if out.get("segmentation_available") else None
+    try:
+        if safe_json:
+            save_json_if_needed(args, out)
+    except OSError as e:
+        out.update(status="error", error=f"Cannot write output JSON: {e}", success_marker=None)
+    print(json.dumps(out, ensure_ascii=False, allow_nan=False))
     return out
 
 
@@ -1545,16 +1400,14 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     print("Python:", sys.version)
     print("OpenCV:", cv2.__version__)
     print("NumPy:", np.__version__)
-    print("Pandas:", getattr(pd, "__version__", "not installed"))
-    print("Matplotlib:", "installed" if plt is not None else "not installed")
-    print("Requests:", "installed" if requests is not None else "not installed")
-    print("Torch:", torch.__version__ if TORCH_AVAILABLE else "not installed")
-    if TORCH_AVAILABLE:
-        print("CUDA available:", torch.cuda.is_available())
-        if torch.cuda.is_available():
-            print("GPU:", torch.cuda.get_device_name(0))
-    print("OK")
-
+    print("Matplotlib: not required by the core pipeline")
+    print("Requests: not required; remote downloads are disabled")
+    print("Model framework:", MODEL_FRAMEWORK)
+    print("Torch: disabled by project policy (NumPy model only)")
+    print("scikit-learn: disabled by project policy")
+    print("Class map:", CLASS_VERSION)
+    print("Model inference: optional trusted NumPy .npz checkpoint plus SHA-256")
+    print("Core CV and NumPy model: OK")
 
 def cmd_build(args: argparse.Namespace) -> None:
     project_root = Path(args.project_root)
@@ -1563,7 +1416,7 @@ def cmd_build(args: argparse.Namespace) -> None:
     if args.input_dir:
         paths = list_images(Path(args.input_dir))
     else:
-        print("Không có --input_dir, bắt đầu tải ảnh từ Wikimedia Commons.")
+        print("Remote downloads are disabled; supply --input_dir.")
         paths = download_commons_images(raw_dir, target_count=args.target_count, max_downloads=args.max_downloads)
     print(f"Tổng ảnh đầu vào: {len(paths)}")
     summary = build_pseudomask_dataset(
@@ -1575,7 +1428,7 @@ def cmd_build(args: argparse.Namespace) -> None:
         keep_threshold=args.keep_threshold,
         min_good_lines=args.min_good_lines,
         exact_dedupe=not args.no_exact_dedupe,
-        max_images=args.max_images,
+        max_images=args.max_images, seed=args.seed,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     print("Dataset CSV:", dataset_dir / "labels_pseudo_strict.csv")
@@ -1591,7 +1444,7 @@ def cmd_mask_folder(args: argparse.Namespace) -> None:
         keep_threshold=args.keep_threshold,
         min_good_lines=args.min_good_lines,
         exact_dedupe=not args.no_exact_dedupe,
-        max_images=args.max_images,
+        max_images=args.max_images, seed=args.seed,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
@@ -1606,7 +1459,7 @@ def cmd_single_mask(args: argparse.Namespace) -> None:
     imwrite_rgb(out / "crop.jpg", crop)
     imwrite_gray(out / "pseudo_mask.png", sem)
     imwrite_rgb(out / "overlay.jpg", make_overlay(crop, sem))
-    report = {"diagnostic": asdict(diag), "pseudo_report": rep, "class_map": CLASS_MAP}
+    report = {"diagnostic": asdict(diag), "pseudo_report": rep, "class_map": CLASS_MAP, "class_map_version": CLASS_VERSION, "inference_source": "classical CV fallback", "model_used": False}
     with open(out / "report.json", "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1614,10 +1467,12 @@ def cmd_single_mask(args: argparse.Namespace) -> None:
 
 def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Palmistry strict fully automatic pipeline")
+    p.add_argument("--config", default=None)
+    p.add_argument("--seed", type=int, default=42)
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("doctor")
 
-    b = sub.add_parser("build", help="Tự tải hoặc đọc ảnh local, tạo dataset pseudo-mask lọc gắt")
+    b = sub.add_parser("build", help="Read local images and build pseudo-masks; remote download disabled")
     b.add_argument("--project_root", default=".")
     b.add_argument("--output_dir", default="dataset_strict")
     b.add_argument("--input_dir", default="")
@@ -1667,14 +1522,21 @@ def make_parser() -> argparse.ArgumentParser:
     tr.add_argument("--dice_weight", type=float, default=1.0)
     tr.add_argument("--grad_clip", type=float, default=1.0)
     tr.add_argument("--patience", type=int, default=20)
-    tr.add_argument("--resume", choices=["auto","none"], default="auto")
+    tr.add_argument("--resume", choices=["auto","none"], default="none")
+    tr.add_argument("--checkpoint-sha256", default="")
+    tr.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     tr.add_argument("--num_workers", type=int, default=0)
     tr.add_argument("--amp", action="store_true", default=True)
     tr.add_argument("--cpu", action="store_true")
 
     pr = sub.add_parser("predict", help="Phân tích 1 ảnh, tự chẩn đoán lỗi, chỉ đọc line > threshold")
     pr.add_argument("--image", required=True)
+    pr.add_argument("--mirrored", choices=["yes", "no", "unknown"], default="unknown")
     pr.add_argument("--checkpoint", default="")
+    pr.add_argument("--checkpoint-sha256", default="")
+    pr.add_argument("--allow-classical-fallback", action="store_true")
+    pr.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    pr.add_argument("--request-id", default="")
     pr.add_argument("--out_json", default="prediction_result.json")
     pr.add_argument("--out_mask", default="predicted_mask.png")
     pr.add_argument("--out_overlay", default="prediction_overlay.jpg")
@@ -1686,12 +1548,49 @@ def make_parser() -> argparse.ArgumentParser:
     pr.add_argument("--require_validation_scores", action="store_true")
     pr.add_argument("--print_reading", action="store_true", default=True)
     pr.add_argument("--cpu", action="store_true")
+    fixture = sub.add_parser("fixture", help="Generate deterministic synthetic test-only images and masks")
+    fixture.add_argument("--output_dir", default="artifacts/fixture")
+    evaluation = sub.add_parser("evaluate", help="Compare aligned semantic masks; never used for model selection")
+    evaluation.add_argument("--prediction", required=True)
+    evaluation.add_argument("--target", required=True)
+    evaluation.add_argument("--dataset-name", required=True)
+    evaluation.add_argument("--split", choices=["train", "val", "test", "fixture-only"], required=True)
+    evaluation.add_argument("--inference-source", choices=["trained model", "classical CV fallback", "deterministic test fixture"], required=True)
+    evaluation.add_argument("--output", default="artifacts/evaluation.json")
     return p
+
+
+def validate_parameters(args):
+    for key in ("out_size", "input_size"):
+        if hasattr(args, key):
+            validate_size(getattr(args, key))
+    for key in ("batch_size", "grad_accum", "epochs", "patience", "min_short_side"):
+        if hasattr(args, key) and getattr(args, key) <= 0:
+            raise ValueError(f"{key} must be positive")
+    for key in ("strict_line_threshold", "keep_threshold", "read_threshold", "min_image_quality", "dropout"):
+        if hasattr(args, key) and not 0 <= getattr(args, key) <= 1:
+            raise ValueError(f"{key} must be finite in [0, 1]")
+    for key in ("lr", "grad_clip", "weight_decay", "dice_weight", "blur_threshold", "max_train_hours"):
+        if hasattr(args, key) and (not math.isfinite(getattr(args, key)) or getattr(args, key) < 0):
+            raise ValueError(f"{key} must be finite and nonnegative")
+    if getattr(args, "lr", 1) == 0 or getattr(args, "num_workers", 0) < 0:
+        raise ValueError("lr must be positive and num_workers nonnegative")
 
 
 def main():
     parser = make_parser()
+    # Config supplies defaults; explicit CLI flags always win.
+    pre, _ = parser.parse_known_args()
+    config = load_config(pre.config)
+    parser.set_defaults(seed=config["seed"])
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for child in action.choices.values():
+                destinations = {a.dest for a in child._actions}
+                child.set_defaults(**{k: v for k, v in config.items() if k in destinations})
     args = parser.parse_args()
+    if args.cmd != "predict":
+        validate_parameters(args)
     if getattr(args, "max_images", 0) == 0:
         args.max_images = None
     if args.cmd == "doctor": cmd_doctor(args)
@@ -1699,7 +1598,20 @@ def main():
     elif args.cmd == "mask-folder": cmd_mask_folder(args)
     elif args.cmd == "single-mask": cmd_single_mask(args)
     elif args.cmd == "train": train_model(args)
-    elif args.cmd == "predict": predict_image(args)
+    elif args.cmd == "predict":
+        result = predict_image(args)
+        if result.get("status") == "error" or not result.get("segmentation_available"):
+            raise SystemExit(2)
+    elif args.cmd == "fixture":
+        from prototype_fixture import generate_fixture
+        print(json.dumps(generate_fixture(Path(args.output_dir)), indent=2))
+    elif args.cmd == "evaluate":
+        pred = cv2.imread(args.prediction, cv2.IMREAD_UNCHANGED)
+        target = cv2.imread(args.target, cv2.IMREAD_UNCHANGED)
+        result = {"dataset": args.dataset_name, "split": args.split, "inference_source": args.inference_source,
+                  "provenance": provenance(args), **metrics_from_confusion(confusion_matrix(pred, target))}
+        write_json(args.output, result)
+        print(json.dumps(result, indent=2))
     else: parser.print_help()
 
 if __name__ == "__main__":

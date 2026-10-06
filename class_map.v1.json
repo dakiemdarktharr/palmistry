@@ -1,0 +1,12 @@
+{
+  "version": "palm-lines-v1",
+  "classes": {
+    "0": "background",
+    "1": "palm_area",
+    "2": "life_line",
+    "3": "head_line",
+    "4": "heart_line",
+    "5": "minor_or_unknown_line"
+  },
+  "migration": "Legacy fate_line labels require explicit fate-v0 conversion; class 5 becomes minor_or_unknown_line."
+}

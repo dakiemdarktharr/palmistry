@@ -1,0 +1,785 @@
+{
+  "date_utc": "2026-09-12",
+  "python": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+  "process_startup_seconds": [
+    0.06196279999858234,
+    0.052068599994527176,
+    0.0512248000013642
+  ],
+  "process_startup_median_seconds": 0.052068599994527176,
+  "fixture": {
+    "fixture": "geometric-v1",
+    "inference_source": "deterministic test fixture",
+    "test_only": true,
+    "split_counts": {
+      "train": {
+        "samples": 1,
+        "groups": 1
+      },
+      "val": {
+        "samples": 3,
+        "groups": 1
+      },
+      "test": {
+        "samples": 2,
+        "groups": 1
+      }
+    },
+    "expected": {
+      "0": {
+        "rgb_sha256": "67bd9dab6604e4663d9ee1fdcdf746a8615f89ee40e45990dd37d83bfbab7e27",
+        "mask_sha256": "b16176904cc84a5e35cc09a50da52e11c7ff4fc0da62daf57eb302926988a888",
+        "class_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "1": {
+        "rgb_sha256": "2e6068bb6aa8f36062c3605d1b4d2ea7ddb5e7b8ed121fa11922b3cb1e6468e9",
+        "mask_sha256": "ac96b31e419afe8bd2c66f49cd4edbbe263aa2d56d3c2f8e6d5dee6cb099dc12",
+        "class_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "2": {
+        "rgb_sha256": "e66fe7cb56b82ded008bd80dd5cd0bdf5cd78237e58a5ef27d54c877df24cf2a",
+        "mask_sha256": "745888a580e12a8283248072e9e5f0d25045c30ed27149dcad04b9c1fd9d4223",
+        "class_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "3": {
+        "rgb_sha256": "3ac842c8f7ad03096e5ceef4ade6f6bbab8a2f5c70fad3ebe9da7c7ffae72554",
+        "mask_sha256": "550b3fe07f0e91b053802f46b68bfe725a54c421c028b3233ec1a6d88dcb8bb8",
+        "class_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "4": {
+        "rgb_sha256": "04c0444c4b73a33938966f0800ec8c391cb21da0bc0e87a1d10cf712ba1a4eb4",
+        "mask_sha256": "0e98391f898e84a66ecf552af255464125d59f939286082b29c91f300f8cb090",
+        "class_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      },
+      "5": {
+        "rgb_sha256": "b1c154581d2b0c7da22c21d71cfa226a12cc7c2ffab55ee5e4e80760488081ef",
+        "mask_sha256": "1918de9a942681ca3cdaf147c0581a9dedf90333dde410d15d7429b0a8f4f5a9",
+        "class_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ]
+      }
+    },
+    "demo_split": "test",
+    "demo_source": "images/case_1/input.png",
+    "crop_meta": {
+      "scale": 1.28,
+      "x0": 21,
+      "y0": 0,
+      "new_w": 86,
+      "new_h": 128,
+      "orig_w": 67,
+      "orig_h": 100,
+      "crop_method": "skin_bbox",
+      "hand_score": 0.524583936891397,
+      "crop_xyxy": [
+        28,
+        19,
+        95,
+        119
+      ]
+    },
+    "limitation": "Synthetic shape mechanics only. Subject IDs describe generated cases, not people."
+  },
+  "commands": [
+    {
+      "name": "compile",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "-m",
+        "compileall",
+        "-q",
+        "bootstrap_review.py",
+        "giao_dien_ui.py",
+        "palmistry_strict_auto_onefile.py",
+        "palm_geometry.py",
+        "palm_photo_ui.py",
+        "pipeline.py",
+        "prototype_common.py",
+        "prototype_fixture.py",
+        "tien_xu_ly.py",
+        "tests",
+        "scripts"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.22293080000963528
+    },
+    {
+      "name": "imports",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "-c",
+        "import palmistry_strict_auto_onefile, tien_xu_ly, giao_dien_ui, prototype_common, prototype_fixture; print('all imports OK')"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 1.5313186000130372
+    },
+    {
+      "name": "http-demo",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "-c",
+        "import threading,urllib.request; import giao_dien_ui as ui; from werkzeug.serving import make_server; server=make_server(ui.HOST,0,ui.app); worker=threading.Thread(target=server.serve_forever,daemon=True); worker.start(); response=urllib.request.urlopen('http://127.0.0.1:'+str(server.server_port)+'/api/status'); assert response.status==200; print('loopback HTTP',response.status); server.shutdown(); worker.join(); server.server_close()"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 1.2458641999983229
+    },
+    {
+      "name": "help",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "--help"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.5673406999994768
+    },
+    {
+      "name": "doctor",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "doctor"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.5775699999940116
+    },
+    {
+      "name": "dependencies",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "-m",
+        "pip",
+        "check"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 1.130655699991621
+    },
+    {
+      "name": "freeze",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "-m",
+        "pip",
+        "freeze"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.8147376999986591
+    },
+    {
+      "name": "tests",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 33.61999029999424
+    },
+    {
+      "name": "fixture",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "fixture",
+        "--output_dir",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.7297871000046143
+    },
+    {
+      "name": "preprocess",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "single-mask",
+        "--image",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture\\input.png",
+        "--output_dir",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\preprocessed",
+        "--out_size",
+        "128",
+        "--min_short_side",
+        "128"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.6260463999933563
+    },
+    {
+      "name": "train",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "--seed",
+        "42",
+        "train",
+        "--data_root",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture",
+        "--labels_csv",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture\\labels.csv",
+        "--out_dir",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model-smoke",
+        "--input_size",
+        "32",
+        "--epochs",
+        "1",
+        "--batch_size",
+        "1",
+        "--grad_accum",
+        "2",
+        "--model_size",
+        "tiny",
+        "--device",
+        "cpu",
+        "--resume",
+        "none"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.7730346000025747
+    },
+    {
+      "name": "classical-predict",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "predict",
+        "--image",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture\\input.png",
+        "--out_size",
+        "128",
+        "--min_short_side",
+        "128",
+        "--min_image_quality",
+        "0",
+        "--device",
+        "cpu",
+        "--allow-classical-fallback",
+        "--out_json",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\classical\\result.json",
+        "--out_mask",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\classical\\mask.png",
+        "--out_overlay",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\classical\\overlay.png"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.7489309999946272
+    },
+    {
+      "name": "classical-evaluate",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "evaluate",
+        "--prediction",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\classical\\mask.png",
+        "--target",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture\\expected_mask.png",
+        "--dataset-name",
+        "geometric-v1",
+        "--split",
+        "fixture-only",
+        "--inference-source",
+        "classical CV fallback",
+        "--output",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\classical\\evaluation.json"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.7078897999890614
+    },
+    {
+      "name": "model-predict",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "predict",
+        "--image",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture\\input.png",
+        "--out_size",
+        "128",
+        "--min_short_side",
+        "128",
+        "--min_image_quality",
+        "0",
+        "--device",
+        "cpu",
+        "--checkpoint",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model-smoke\\checkpoints\\best.npz",
+        "--checkpoint-sha256",
+        "d00e4271b371d93e9a3d274e5f8a6dc6ffad2ce4d69f6dc46fe834bea0c61406",
+        "--out_json",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model\\result.json",
+        "--out_mask",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model\\mask.png",
+        "--out_overlay",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model\\overlay.png"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.7476233000052162
+    },
+    {
+      "name": "model-evaluate",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "evaluate",
+        "--prediction",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model\\mask.png",
+        "--target",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture\\expected_mask.png",
+        "--dataset-name",
+        "geometric-v1",
+        "--split",
+        "fixture-only",
+        "--inference-source",
+        "trained model",
+        "--output",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model\\evaluation.json"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 0.7218781999981729
+    },
+    {
+      "name": "ui-offline",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "-c",
+        "import os,json,cv2; from pathlib import Path; os.environ['PALM_CONFIG']='D:\\\\Palmistry\\\\artifacts\\\\verification-four-lines-v2\\\\fixture-ui-config.json'; os.environ['PALM_CHECKPOINT']='D:\\\\Palmistry\\\\artifacts\\\\verification-four-lines-v2\\\\model-smoke\\\\checkpoints\\\\best.npz'; os.environ['PALM_CHECKPOINT_SHA256']='d00e4271b371d93e9a3d274e5f8a6dc6ffad2ce4d69f6dc46fe834bea0c61406'; import giao_dien_ui as ui; e=ui.LiveEngine(); assert e.ready; frame=cv2.imread('D:\\\\Palmistry\\\\artifacts\\\\verification-four-lines-v2\\\\fixture\\\\input.png'); mask,overlay,data,metrics,reading=e.run_predict(frame); assert mask.shape==overlay.shape[:2]; Path('D:\\\\Palmistry\\\\artifacts\\\\verification-four-lines-v2\\\\ui-runtime.json').write_text(json.dumps({'shape':list(mask.shape),'elapsed_seconds':data['elapsed_seconds'],'subprocess_end_to_end_seconds':data['subprocess_end_to_end_seconds']})); print('offline UI subprocess OK')"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "seconds": 2.0792675000120653
+    },
+    {
+      "name": "bad-image",
+      "argv": [
+        "D:\\Palmistry\\.venv\\Scripts\\python.exe",
+        "palmistry_strict_auto_onefile.py",
+        "predict",
+        "--image",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\not-present.png",
+        "--allow-classical-fallback",
+        "--out_json",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\bad-image.json",
+        "--out_mask",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\bad-mask.png",
+        "--out_overlay",
+        "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\bad-overlay.png"
+      ],
+      "exit_code": 2,
+      "expected_exit_code": 2,
+      "seconds": 0.6353581000003032
+    }
+  ],
+  "metrics": {
+    "classical": {
+      "dataset": "geometric-v1",
+      "split": "fixture-only",
+      "inference_source": "classical CV fallback",
+      "provenance": {
+        "config": {
+          "config": null,
+          "seed": 42,
+          "cmd": "evaluate",
+          "prediction": "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\classical\\mask.png",
+          "target": "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture\\expected_mask.png",
+          "dataset_name": "geometric-v1",
+          "split": "fixture-only",
+          "inference_source": "classical CV fallback",
+          "output": "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\classical\\evaluation.json",
+          "max_images": null
+        },
+        "seed": 42,
+        "model_version": "numpy-diagonal-gaussian-pixel-v2",
+        "class_map_version": "palm-lines-v2",
+        "git_revision": "e729a6d8d339a6ace70c5d4ef868962d215a7d98",
+        "git_dirty": true,
+        "manifest_sha256": null,
+        "source_sha256": {
+          "bootstrap_review.py": "f627af79556434dd29fb82eb065d9c77f7c77c22afd4ce0b645067a3003446fe",
+          "giao_dien_ui.py": "2630f8df954a16b8b4a8d9af6613c0c2da967421fa9fbcbad9ae4a0d51f18ee8",
+          "palm_geometry.py": "825e4929a8b16c1b12ca950e8684c7025fed47ac38af0b006617c6faaf623f52",
+          "palm_photo_ui.py": "5fe4a901a349c6ddde0d4af36ddbf324b5b7cd25fcf4ecf5a2192ab7becf6234",
+          "palmistry_strict_auto_onefile.py": "018837212263a8fbe4439ab4bc35b4fc11b424f39e9d9887259b288353df8441",
+          "pipeline.py": "f858664cea7de76ad3a926a3d12ab76fd5a9a5fa1070485c244423939e6ea29f",
+          "prototype_common.py": "0778a07a675dd12058523e0dff333327470f945bad7d37ba5fd016439fa964b2",
+          "prototype_fixture.py": "73bce8d9570234b415f2b7b4c63387356dd5a0ff364bb9044b635c678ba3d5c9",
+          "tien_xu_ly.py": "21eb07d6908b6ff39d5ce18a690eee060eedf6905ca2ea4afd055e243e1cfe9b"
+        },
+        "numpy": "2.4.6",
+        "opencv": "5.0.0",
+        "score_semantics": "uncalibrated heuristic ranking; not probability"
+      },
+      "per_class": {
+        "background": {
+          "iou": 0.9303070258052364,
+          "dice": 0.9638953942232631,
+          "precision": 1.0,
+          "recall": 0.9303070258052364,
+          "f1": 0.9638953942232631,
+          "support_pixels": 10618
+        },
+        "palm_area": {
+          "iou": 0.791115893021826,
+          "dice": 0.8833776709860122,
+          "precision": 0.791115893021826,
+          "recall": 1.0,
+          "f1": 0.8833776709860122,
+          "support_pixels": 5147
+        },
+        "life_line": {
+          "iou": 0.0,
+          "dice": 0.0,
+          "precision": null,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support_pixels": 204
+        },
+        "head_line": {
+          "iou": 0.0,
+          "dice": 0.0,
+          "precision": null,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support_pixels": 166
+        },
+        "heart_line": {
+          "iou": 0.0,
+          "dice": 0.0,
+          "precision": null,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support_pixels": 179
+        },
+        "minor_or_unknown_line": {
+          "iou": 0.0,
+          "dice": 0.0,
+          "precision": null,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support_pixels": 70
+        },
+        "simian_line": {
+          "iou": null,
+          "dice": null,
+          "precision": null,
+          "recall": null,
+          "f1": null,
+          "support_pixels": 0
+        }
+      },
+      "mean_iou": 0.2869038198045104,
+      "confusion_matrix": [
+        [
+          9878,
+          740,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          5147,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          204,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          166,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          179,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          70,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "pixel_count": 16384,
+      "absent_class_policy": "undefined denominators are null; macro IoU includes nonempty unions"
+    },
+    "model": {
+      "dataset": "geometric-v1",
+      "split": "fixture-only",
+      "inference_source": "trained model",
+      "provenance": {
+        "config": {
+          "config": null,
+          "seed": 42,
+          "cmd": "evaluate",
+          "prediction": "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model\\mask.png",
+          "target": "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\fixture\\expected_mask.png",
+          "dataset_name": "geometric-v1",
+          "split": "fixture-only",
+          "inference_source": "trained model",
+          "output": "D:\\Palmistry\\artifacts\\verification-four-lines-v2\\model\\evaluation.json",
+          "max_images": null
+        },
+        "seed": 42,
+        "model_version": "numpy-diagonal-gaussian-pixel-v2",
+        "class_map_version": "palm-lines-v2",
+        "git_revision": "e729a6d8d339a6ace70c5d4ef868962d215a7d98",
+        "git_dirty": true,
+        "manifest_sha256": null,
+        "source_sha256": {
+          "bootstrap_review.py": "f627af79556434dd29fb82eb065d9c77f7c77c22afd4ce0b645067a3003446fe",
+          "giao_dien_ui.py": "2630f8df954a16b8b4a8d9af6613c0c2da967421fa9fbcbad9ae4a0d51f18ee8",
+          "palm_geometry.py": "825e4929a8b16c1b12ca950e8684c7025fed47ac38af0b006617c6faaf623f52",
+          "palm_photo_ui.py": "5fe4a901a349c6ddde0d4af36ddbf324b5b7cd25fcf4ecf5a2192ab7becf6234",
+          "palmistry_strict_auto_onefile.py": "018837212263a8fbe4439ab4bc35b4fc11b424f39e9d9887259b288353df8441",
+          "pipeline.py": "f858664cea7de76ad3a926a3d12ab76fd5a9a5fa1070485c244423939e6ea29f",
+          "prototype_common.py": "0778a07a675dd12058523e0dff333327470f945bad7d37ba5fd016439fa964b2",
+          "prototype_fixture.py": "73bce8d9570234b415f2b7b4c63387356dd5a0ff364bb9044b635c678ba3d5c9",
+          "tien_xu_ly.py": "21eb07d6908b6ff39d5ce18a690eee060eedf6905ca2ea4afd055e243e1cfe9b"
+        },
+        "numpy": "2.4.6",
+        "opencv": "5.0.0",
+        "score_semantics": "uncalibrated heuristic ranking; not probability"
+      },
+      "per_class": {
+        "background": {
+          "iou": 0.9729856486258325,
+          "dice": 0.9863078824759912,
+          "precision": 0.9958717357910907,
+          "recall": 0.9769259747598418,
+          "f1": 0.9863078824759912,
+          "support_pixels": 10618
+        },
+        "palm_area": {
+          "iou": 0.8717111232081292,
+          "dice": 0.9314590402326709,
+          "precision": 0.9295665634674922,
+          "recall": 0.9333592383912959,
+          "f1": 0.9314590402326709,
+          "support_pixels": 5147
+        },
+        "life_line": {
+          "iou": 0.13625866050808313,
+          "dice": 0.23983739837398374,
+          "precision": 0.2048611111111111,
+          "recall": 0.28921568627450983,
+          "f1": 0.23983739837398374,
+          "support_pixels": 204
+        },
+        "head_line": {
+          "iou": 0.3903345724907063,
+          "dice": 0.5614973262032086,
+          "precision": 0.5048076923076923,
+          "recall": 0.6325301204819277,
+          "f1": 0.5614973262032086,
+          "support_pixels": 166
+        },
+        "heart_line": {
+          "iou": 0.45483870967741935,
+          "dice": 0.6252771618625277,
+          "precision": 0.5183823529411765,
+          "recall": 0.7877094972067039,
+          "f1": 0.6252771618625277,
+          "support_pixels": 179
+        },
+        "minor_or_unknown_line": {
+          "iou": 0.0,
+          "dice": 0.0,
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support_pixels": 70
+        },
+        "simian_line": {
+          "iou": null,
+          "dice": null,
+          "precision": null,
+          "recall": null,
+          "f1": null,
+          "support_pixels": 0
+        }
+      },
+      "mean_iou": 0.47102145241836163,
+      "confusion_matrix": [
+        [
+          10373,
+          245,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          43,
+          4804,
+          129,
+          62,
+          85,
+          24,
+          0
+        ],
+        [
+          0,
+          58,
+          59,
+          41,
+          46,
+          0,
+          0
+        ],
+        [
+          0,
+          16,
+          37,
+          105,
+          0,
+          8,
+          0
+        ],
+        [
+          0,
+          31,
+          7,
+          0,
+          141,
+          0,
+          0
+        ],
+        [
+          0,
+          14,
+          56,
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      ],
+      "pixel_count": 16384,
+      "absent_class_policy": "undefined denominators are null; macro IoU includes nonempty unions"
+    }
+  },
+  "four_line_cv": {
+    "browser": {
+      "run": "pipeline_ui_001_ca643763_96c62a77_v2_daad0bd1",
+      "previousRun": "pipeline_ui_001_ca643763_96c62a77",
+      "originalReviewUnchanged": true,
+      "rowCount": 40,
+      "photoHTTP": 200,
+      "photoStatus": "need_retake",
+      "handedness": null,
+      "acceptedLines": [],
+      "errors": []
+    },
+    "unittest": {
+      "total": 83,
+      "passed": 78,
+      "skipped": 5
+    },
+    "real_data_accuracy": "not established",
+    "simian_model": "requires reviewed simian training examples",
+    "personality_inference": "not implemented"
+  }
+}

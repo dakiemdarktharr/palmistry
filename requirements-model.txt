@@ -1,0 +1,2 @@
+# No extra ML framework is used. NumPy/OpenCV provide the project model. rarfile enables ZIP/RAR dataset import.
+-r requirements.txt

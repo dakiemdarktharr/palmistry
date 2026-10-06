@@ -2,6 +2,8 @@ import argparse
 import csv
 import json
 import re
+import hashlib
+from prototype_common import (CLASS_MAP, CLASS_VERSION, validate_mask, validate_size, read_rgb, write_class_map, group_rows, perceptual_hash, sha256)
 from pathlib import Path
 
 import cv2
@@ -10,6 +12,9 @@ from PIL import Image, ImageOps
 from tqdm import tqdm
 
 CLASS_ALIASES = {
+    "minor": 5,
+    "minor_or_unknown_line": 5,
+    "unknown_line": 5,
     "life": 2,
     "life_line": 2,
     "life line": 2,
@@ -25,17 +30,11 @@ CLASS_ALIASES = {
     "fate": 5,
     "fate_line": 5,
     "fate line": 5,
-    "fateline": 5
+    "fateline": 5,
+    "simian": 6, "simian_line": 6, "simian line": 6, "single transverse palmar crease": 6
 }
 
-MASK_CLASS_NAMES = {
-    0: "background",
-    1: "palm_area",
-    2: "life_line",
-    3: "head_line",
-    4: "heart_line",
-    5: "fate_line"
-}
+MASK_CLASS_NAMES = CLASS_MAP
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
@@ -152,21 +151,25 @@ def bbox_to_line(row, w, h):
     return [(cx, max(0, cy - bh_px // 2)), (cx, min(h - 1, cy + bh_px // 2))]
 
 def draw_line_mask(mask, pts, cls, thickness):
+    validate_mask(mask)
+    if cls not in (2, 3, 4, 5, 6) or thickness <= 0:
+        raise ValueError("Line class must be 2..5 and thickness positive.")
     if len(pts) < 2:
         return
     pts_np = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
-    cv2.polylines(mask, [pts_np], False, int(cls), int(thickness), lineType=cv2.LINE_AA)
+    cv2.polylines(mask, [pts_np], False, int(cls), int(thickness), lineType=cv2.LINE_8)
+    validate_mask(mask)
 
 def create_palm_area(mask, pts, w, h):
     if len(pts) < 3:
-        mask[mask == 0] = 1
-        return
+        raise ValueError("invalid_palm_polygon: at least three non-collinear points required")
     arr = np.array(pts, dtype=np.int32)
     hull = cv2.convexHull(arr)
+    if cv2.contourArea(hull) <= 0:
+        raise ValueError("invalid_palm_polygon: zero-area hull")
     area = np.zeros((h, w), dtype=np.uint8)
     cv2.fillConvexPoly(area, hull, 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (91, 91))
-    area = cv2.dilate(area, kernel, iterations=2)
+    # Conservative line-point hull is a pseudo palm region, not hand ground truth.
     mask[(area > 0) & (mask == 0)] = 1
 
 def make_overlay(img, mask):
@@ -176,7 +179,8 @@ def make_overlay(img, mask):
         2: (255, 60, 60),
         3: (60, 255, 60),
         4: (60, 120, 255),
-        5: (255, 220, 60)
+        5: (255, 220, 60),
+        6: (0, 230, 230)
     }
     for cls, color in colors.items():
         m = mask == cls
@@ -188,7 +192,7 @@ def make_overlay(img, mask):
 def safe_stem(path):
     s = Path(path).stem
     s = re.sub(r"[^\w\-.]+", "_", s)
-    return s[:120]
+    return s[:100] + "_" + hashlib.sha256(Path(path).as_posix().encode("utf-8")).hexdigest()[:16]
 
 def infer_split(path):
     parts = [p.lower() for p in Path(path).parts]
@@ -198,7 +202,10 @@ def infer_split(path):
         return "test"
     return "train"
 
-def convert_dataset(input_dir, output_dir, out_size, line_thickness, min_lines, ignore_fate):
+def convert_dataset(input_dir, output_dir, out_size, line_thickness, min_lines, ignore_fate, class_map_version=CLASS_VERSION):
+    validate_size(out_size)
+    if not 1 <= min_lines <= 3 or not 1 <= line_thickness <= out_size:
+        raise ValueError("min_lines must be 1..3; line_thickness must be 1..out_size")
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     images_dir = output_dir / "images"
@@ -209,7 +216,11 @@ def convert_dataset(input_dir, output_dir, out_size, line_thickness, min_lines, 
         d.mkdir(parents=True, exist_ok=True)
     yaml_path = find_yaml(input_dir)
     names = parse_names_from_yaml(yaml_path) if yaml_path else {}
-    images = find_images(input_dir)
+    if any("fate" in norm_name(name) for name in names.values()) and not ignore_fate and class_map_version != "fate-v0":
+        raise ValueError("Legacy fate labels require --class-map-version fate-v0 (explicit merge into minor_or_unknown_line).")
+    images = sorted(find_images(input_dir))
+    if not images:
+        raise ValueError("Empty input dataset: no images found.")
     rows_out = []
     rejected = []
     split_counts = {}
@@ -227,17 +238,15 @@ def convert_dataset(input_dir, output_dir, out_size, line_thickness, min_lines, 
             rejected.append({"image": str(img_path), "reason": "empty_label"})
             continue
         try:
-            with Image.open(img_path) as im:
-                im = ImageOps.exif_transpose(im).convert("RGB")
-                orig_w, orig_h = im.size
-                im_resized = im.resize((out_size, out_size), Image.BILINEAR)
-                img_np = np.array(im_resized)
+            rgb = read_rgb(img_path)
+            orig_h, orig_w = rgb.shape[:2]
+            img_np = cv2.resize(rgb, (out_size, out_size), interpolation=cv2.INTER_AREA)
         except Exception as e:
             rejected.append({"image": str(img_path), "reason": f"bad_image:{e}"})
             continue
         mask = np.zeros((out_size, out_size), dtype=np.uint8)
         all_pts = []
-        detected = {"life": 0, "head": 0, "heart": 0, "fate": 0}
+        detected = {"life": 0, "head": 0, "heart": 0, "minor": 0}
         for row in labels:
             cls = class_id_to_mask_class(int(row[0]), names)
             if ignore_fate and cls == 5:
@@ -262,40 +271,56 @@ def convert_dataset(input_dir, output_dir, out_size, line_thickness, min_lines, 
                 elif cls == 4:
                     detected["heart"] += 1
                 elif cls == 5:
-                    detected["fate"] += 1
+                    detected["minor"] += 1
         good_main = sum(1 for k in ["life", "head", "heart"] if detected[k] > 0)
         if good_main < min_lines:
             rejected.append({"image": str(img_path), "reason": "not_enough_main_lines", "detected": detected})
             continue
-        create_palm_area(mask, all_pts, out_size, out_size)
-        stem = safe_stem(img_path)
+        try:
+            create_palm_area(mask, all_pts, out_size, out_size)
+            validate_mask(mask, img_np.shape[:2])
+        except ValueError as e:
+            rejected.append({"image": str(img_path), "reason": str(e)})
+            continue
+        stem = safe_stem(img_path.relative_to(input_dir))
         out_img = images_dir / f"{stem}.jpg"
         out_mask = masks_dir / f"{stem}_mask.png"
         out_overlay = overlays_dir / f"{stem}_overlay.jpg"
+        if any(p.exists() for p in (out_img, out_mask, out_overlay)):
+            raise FileExistsError(f"Output collision: {stem}; use a new output directory.")
         Image.fromarray(img_np).save(out_img, quality=95)
         Image.fromarray(mask).save(out_mask)
         Image.fromarray(make_overlay(img_np, mask)).save(out_overlay, quality=90)
         split = infer_split(img_path)
         split_counts[split] = split_counts.get(split, 0) + 1
         rows_out.append({
+            "source_path": img_path.relative_to(input_dir).as_posix(),
+            "source_group": img_path.relative_to(input_dir).parent.as_posix(),
+            "sha256": sha256(out_img),
+            "phash": perceptual_hash(read_rgb(out_img)),
+            "class_map_version": CLASS_VERSION,
             "image_path": str(out_img.relative_to(output_dir)).replace("\\", "/"),
             "mask_path": str(out_mask.relative_to(output_dir)).replace("\\", "/"),
             "split": split,
-            "cls_quality": "roboflow_label",
+            "cls_quality": "annotation-derived; bbox-lines and palm hull are pseudo-labels",
             "reg_line_density": float(np.mean(mask >= 2)),
             "life_present": int(detected["life"] > 0),
             "head_present": int(detected["head"] > 0),
             "heart_present": int(detected["heart"] > 0),
-            "fate_present": int(detected["fate"] > 0)
+            "minor_present": int(detected["minor"] > 0)
         })
     csv_path = output_dir / "labels_pseudo_strict.csv"
-    fieldnames = ["image_path", "mask_path", "split", "cls_quality", "reg_line_density", "life_present", "head_present", "heart_present", "fate_present"]
+    split_error = None
+    try:
+        rows_out = group_rows(rows_out, assign=False)
+    except ValueError as e:
+        split_error = str(e)
+    fieldnames = sorted(set().union(*(r.keys() for r in rows_out))) if rows_out else ["image_path", "mask_path", "split"]
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows_out)
-    with open(output_dir / "class_map.json", "w", encoding="utf-8") as f:
-        json.dump(MASK_CLASS_NAMES, f, ensure_ascii=False, indent=2)
+    write_class_map(output_dir)
     with open(reports_dir / "convert_report.json", "w", encoding="utf-8") as f:
         json.dump({
             "input_dir": str(input_dir),
@@ -306,9 +331,15 @@ def convert_dataset(input_dir, output_dir, out_size, line_thickness, min_lines, 
             "accepted": len(rows_out),
             "rejected": len(rejected),
             "split_counts": split_counts,
+            "split_error": split_error,
+            "training_ready": split_error is None,
+            "class_map_version": CLASS_VERSION,
+            "conversion_mode": class_map_version,
             "rejected_sample": rejected[:100]
         }, f, ensure_ascii=False, indent=2)
     print(json.dumps({"accepted": len(rows_out), "rejected": len(rejected), "csv": str(csv_path), "output_dir": str(output_dir)}, ensure_ascii=False, indent=2))
+    if split_error:
+        raise ValueError("Conversion report saved; training blocked: " + split_error)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -319,8 +350,9 @@ def main():
     parser.add_argument("--line_thickness", type=int, default=11)
     parser.add_argument("--min_lines", type=int, default=1)
     parser.add_argument("--ignore_fate", action="store_true")
+    parser.add_argument("--class-map-version", choices=[CLASS_VERSION, "fate-v0"], default=CLASS_VERSION)
     args = parser.parse_args()
-    convert_dataset(args.input_dir, args.output_dir, args.out_size, args.line_thickness, args.min_lines, args.ignore_fate)
+    convert_dataset(args.input_dir, args.output_dir, args.out_size, args.line_thickness, args.min_lines, args.ignore_fate, args.class_map_version)
 
 if __name__ == "__main__":
     main()
