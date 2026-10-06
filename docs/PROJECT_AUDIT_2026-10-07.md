@@ -15,10 +15,12 @@ pipeline and tests must be committed with the fixes for a reproducible checkout.
 | Archive pixel limits were checked after OpenCV decoding | A small compressed image could allocate an excessive pixel buffer before rejection | Inspect the encoded dimensions first for ZIP/RAR in CLI and web paths; regression asserts OpenCV is never called for an oversized header |
 | JSON state/history could be overwritten partially | Failed writes could destroy a previously valid document | Serialize, flush and sync a unique sibling file, then atomically replace; regression simulates a failed replacement and verifies old data and temp cleanup |
 | A broken keypoint project blocked the dashboard | Healthy projects became unavailable when another project's JSON or annotation was unreadable | Isolate errors per project and show affected names in the UI without altering their files |
+| Pseudo-label metadata keys used unnormalized paths | Windows short-path aliases missed identity metadata and misclassified held-out subjects as missing metadata | Normalize relative/absolute metadata paths against the source root and reject conflicting aliases; the original workflow regression exposed this on GitHub Windows CI |
 | Compressed checkpoint bounds ignored expanded NPZ size | Compressed arrays could exceed the memory policy | Check ZIP entry sizes before `np.load`; reject malformed archives as actionable errors and verify keypoint checkpoint dimensions/schema |
 | Launcher accepted any HTTP 200 on port 8501 and did not serialize startup | Another installation/server could be displayed; simultaneous clicks could start competing backends | Require `/api/health` to identify Palmistry and the matching directory; hold a named startup mutex until the app is ready |
 | Installer allowed nested source/target directories | Copying into a child of the source could recursively copy the destination; ancestor targets could overwrite source files | Reject equal, child and parent targets before creating files; check venv creation exit status and Python 3.11+ |
 | Legacy workers could open console windows on Windows | Extra terminal windows interrupted the desktop flow | Start analysis and legacy pipeline subprocesses with `CREATE_NO_WINDOW` |
+| Closing the native window bypassed the page's unsaved-edit guard | Unsubmitted keypoint edits could be discarded without the page handling closure | Route native closure through Qt's `RequestClose` and only close on `windowCloseRequested`; desktop smoke verifies `beforeunload` runs |
 | No repository CI or standalone desktop smoke check | A clean checkout could silently regress | Add Windows/Linux verification CI and a Windows Qt template/download smoke test; exclude build output and logs from Git |
 
 The desktop shortcut opens the native PySide6 window, with downloads and review
@@ -41,7 +43,8 @@ python scripts/verify_desktop.py
   training, classical/model prediction and evaluation, offline UI subprocess,
   and malformed-input handling passed. The bad-image CLI correctly returned 2.
 - The desktop smoke test rendered the actual annotation template, executed its
-  JavaScript, opened an app popup and saved a JSON download using a temporary
+  JavaScript, opened an app popup, saved a JSON download and invoked the page's
+  `beforeunload` guard on native closure using a temporary
   local server. It uses no camera or personal dataset.
 - PowerShell scripts parsed successfully. Installer paths equal to, below and
   above the source were all rejected before installation.

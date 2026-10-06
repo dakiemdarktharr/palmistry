@@ -7,7 +7,7 @@ from PySide6.QtCore import QUrl
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QFileDialog, QMainWindow, QMessageBox
-from PySide6.QtWebEngineCore import QWebEngineLoadingInfo, QWebEngineProfile
+from PySide6.QtWebEngineCore import QWebEngineLoadingInfo, QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 
@@ -34,10 +34,25 @@ class AppWindow(QMainWindow):
         self.view = AppView(self)
         self.setCentralWidget(self.view)
         self.view.page().loadingChanged.connect(self._loaded)
+        self._close_confirmed = False
+        self.view.page().windowCloseRequested.connect(self._confirm_close)
         self._back = QShortcut(QKeySequence("Alt+Left"), self)
         self._back.activated.connect(self.view.back)
         self._reload = QShortcut(QKeySequence("Ctrl+R"), self)
         self._reload.activated.connect(self.view.reload)
+
+    def closeEvent(self, event):
+        if self._close_confirmed:
+            self._close_confirmed = False
+            event.accept()
+        else:
+            event.ignore()
+            # Let the annotation page's beforeunload guard protect unsaved work.
+            self.view.page().triggerAction(QWebEnginePage.WebAction.RequestClose)
+
+    def _confirm_close(self):
+        self._close_confirmed = True
+        self.close()
 
     def _loaded(self, info):
         if info.isDownload():

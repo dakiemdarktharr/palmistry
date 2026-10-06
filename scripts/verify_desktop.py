@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 from werkzeug.serving import make_server
 from PySide6.QtCore import QTimer, QUrl
 from PySide6.QtWidgets import QApplication, QFileDialog
@@ -22,6 +22,13 @@ from palm_keypoints import LINES
 
 def main():
     web = Flask(__name__, template_folder=str(ROOT / "templates"))
+    unloaded = threading.Event()
+
+    @web.post("/close-proof")
+    def close_proof():
+        if request.get_data() == b"2":
+            unloaded.set()
+        return "", 204
 
     @web.get("/keypoints")
     def page():
@@ -40,6 +47,7 @@ def main():
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
     application = QApplication(sys.argv)
+    application.setQuitOnLastWindowClosed(False)
     window = AppWindow()
     result = {"ok": False}
 
@@ -52,9 +60,16 @@ def main():
                 return
             try:
                 assert json.loads(output.read_text()) == {"test_only": True}
-                result.update(ok=True, download=True)
+                result.update(download=True)
+                window.close()
+                QTimer.singleShot(1000, verify_close)
+                return
             except Exception as exc:
                 result["error"] = str(exc)
+            application.quit()
+
+        def verify_close():
+            result.update(closeGuard=unloaded.is_set(), ok=unloaded.is_set() and not window.isVisible())
             application.quit()
 
         def requested(download):
@@ -70,7 +85,10 @@ def main():
                 assert popup.window().windowTitle() == "Palmistry Live Camera"
                 popup.window().close()
                 result.update(template=True, popup=True)
-                window.view.page().runJavaScript("location.href='/download'")
+                window.view.page().runJavaScript(
+                    "window.closeProofCount=0;"
+                    "window.addEventListener('beforeunload',()=>navigator.sendBeacon('/close-proof',String(++window.closeProofCount)));"
+                    "location.href='/download'")
             except Exception as exc:
                 result["error"] = str(exc)
                 application.quit()

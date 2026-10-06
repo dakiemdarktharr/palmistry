@@ -124,13 +124,18 @@ def pseudo(project,checkpoint,digest,out,limit=0):
     remaining=read_json(project/'remaining_sources.json');paths=list(dict.fromkeys(remaining.get('paths',[])))
     if limit<0:raise ValueError('limit phải >=0.')
     if limit:paths=paths[:limit]
-    metadata=remaining.get('metadata',{});root=Path(remaining.get('source_root',project)).resolve();out.mkdir(parents=True)
+    root=Path(remaining.get('source_root',project)).resolve();metadata={}
+    for source,meta in remaining.get('metadata',{}).items():
+        key=str((root/str(source)).resolve())
+        if key in metadata and metadata[key]!=meta:raise ValueError('Metadata có đường dẫn trùng sau chuẩn hóa với thông tin người khác nhau.')
+        metadata[key]=meta
+    out.mkdir(parents=True)
     counts={'accepted':0,'review':0,'skipped_known_or_duplicate':0};seen=set()
     with (out/'auto_labels.jsonl').open('w',encoding='utf-8') as auto,(out/'manual_review.jsonl').open('w',encoding='utf-8') as manual:
         for index,source in enumerate(paths):
             record={'source_path':str(source),'provenance':'pseudo_model','checkpoint_sha256':digest,'training_partition':'train_only','human_approved':False}
             try:
-                path=Path(source).resolve()
+                path=(root/str(source)).resolve()
                 if not path.is_relative_to(root):raise ValueError('source_outside_dataset_root')
                 if str(path) in known_paths:counts['skipped_known_or_duplicate']+=1;continue
                 if not path.is_file():raise ValueError('source_image_missing')
