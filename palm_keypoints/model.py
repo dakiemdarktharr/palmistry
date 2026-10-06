@@ -37,7 +37,8 @@ def targets(annotation,meta):
     coords[24:]=to_model(annotation['palm_width_points'],meta);mask[24:]=1
     apparent_right=(annotation['handedness']=='right') != (annotation['mirrored']=='yes')
     target=np.r_[coords.ravel(),presence,float(apparent_right)].astype(np.float32)
-    return target,np.r_[mask.ravel(),np.ones(5)].astype(np.float32)
+    known_side=annotation['handedness']!='unknown' and annotation['mirrored']!='unknown'
+    return target,np.r_[mask.ravel(),np.ones(4),float(known_side)].astype(np.float32)
 
 
 def conv(x,w,b):
@@ -83,9 +84,10 @@ class PoseCNN:
         d=out[:,:52]-target[:,:52];valid=mask[:,:52];den=max(1,float(valid.sum()));delta=.05
         huber=np.where(np.abs(d)<delta,.5*d*d/delta,np.abs(d)-.5*delta)
         coordinate_loss=float((huber*valid).sum()/den)
-        classification_loss=float(np.mean(np.logaddexp(0,logits[:,52:])-target[:,52:]*logits[:,52:]))
+        class_mask=mask[:,52:];class_den=max(1,float(class_mask.sum()))
+        classification_loss=float(((np.logaddexp(0,logits[:,52:])-target[:,52:]*logits[:,52:])*class_mask).sum()/class_den)
         grad=np.zeros_like(out);grad[:,:52]=np.clip(d/delta,-1,1)*valid/den*out[:,:52]*(1-out[:,:52])
-        grad[:,52:]=.15*(out[:,52:]-target[:,52:])/target[:,52:].size
+        grad[:,52:]=.15*(out[:,52:]-target[:,52:])*class_mask/class_den
         grads={'w4':hd.T@grad,'b4':grad.sum(axis=0)};dh=(grad@self.p['w4'].T)*drop
         z1,c1,z2,c2,flat,z3=cache;dz3=dh*(z3>0);grads['w3']=flat.T@dz3;grads['b3']=dz3.sum(axis=0)
         dz2=(dz3@self.p['w3'].T).reshape(z2.shape)*(z2>0)

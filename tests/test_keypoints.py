@@ -10,7 +10,7 @@ from PIL import Image
 from flask import Flask
 from prototype_common import sha256,perceptual_hash
 from palm_keypoints import LINES,SCHEMA
-from palm_keypoints.data import empty_annotation,write_json,annotation_path,validate_annotation,audited_rows,export_yolo,create_from_review,read_json
+from palm_keypoints.data import empty_annotation,write_json,annotation_path,validate_annotation,audited_rows,export_yolo,create_from_review,read_json,limit_review_queue
 from palm_keypoints.spline import trace_line,width_from_points
 from palm_keypoints.model import PoseCNN,prepare_image,to_model,from_model,targets
 from palm_keypoints.workflow import train,infer,pseudo
@@ -55,6 +55,16 @@ class SplineTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_unknown_side_is_not_a_training_label(self):
+        a=annotation('0'*20);a.update(handedness='unknown',mirrored='unknown')
+        x,meta=prepare_image(np.zeros((64,64,3),np.uint8));y,m=targets(a,meta)
+        self.assertEqual(m[-1],0);self.assertTrue(np.all(m[52:56]==1))
+        model=PoseCNN();loss,grad=model.loss_grad(x[None],y[None],m[None],dropout=0)
+        changed=y.copy();changed[-1]=1-y[-1]
+        other,other_grad=model.loss_grad(x[None],changed[None],m[None],dropout=0)
+        self.assertEqual(loss,other);self.assertEqual(grad['b4'][-1],0)
+        for key in grad:np.testing.assert_array_equal(grad[key],other_grad[key])
+
     def test_coordinate_letterbox_roundtrip(self):
         _,meta=prepare_image(np.zeros((120,300,3),np.uint8));p=np.array([[0,0],[1,1],[.2,.7]])
         np.testing.assert_allclose(from_model(to_model(p,meta),meta),p,atol=1e-7)
@@ -78,14 +88,39 @@ class ModelTests(unittest.TestCase):
 
 
 class DataTests(unittest.TestCase):
+    def test_approval_without_optional_hand_metadata(self):
+        a=annotation('0'*20);a.update(handedness='unknown',mirrored='unknown')
+        self.assertEqual(validate_annotation(a,(500,500))['status'],'approved')
+        a['lines']['fate_line']={'status':'unreviewed','points':[]}
+        with self.assertRaises(ValueError):validate_annotation(a,(500,500))
+
+    def test_reduce_queue_preserves_reviewed_labels_and_sources(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);rows=fixture(root,6)
+            for row in rows[:-1]:write_json(annotation_path(root,row['image_id']),empty_annotation(row['image_id']))
+            hashes={r['image_id']:sha256(annotation_path(root,r['image_id'])) for r in rows}
+            result=limit_review_queue(root,3);doc=read_json(root/'project.json')
+            self.assertEqual(result['images'],3);self.assertEqual(result['deferred'],3)
+            self.assertIn(rows[-1]['image_id'],[r['image_id'] for r in doc['images']])
+            self.assertEqual(len(read_json(result['backup'])['project']['images']),6)
+            self.assertEqual(len(read_json(root/'remaining_sources.json')['paths']),3)
+            for row in rows:self.assertEqual(hashes[row['image_id']],sha256(annotation_path(root,row['image_id'])))
+            self.assertEqual(limit_review_queue(root,3)['deferred'],0)
+            with self.assertRaises(ValueError):limit_review_queue(root,0)
+
+    def test_reduce_queue_refuses_to_hide_reviewed_images(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);fixture(root,4);before=sha256(root/'project.json')
+            with self.assertRaises(ValueError):limit_review_queue(root,3)
+            self.assertEqual(before,sha256(root/'project.json'))
+
     def test_schema_and_approval_contract(self):
         a=annotation('0'*20);validate_annotation(a,(500,500));a['lines']['simian_line']=a['lines'].pop('fate_line')
         with self.assertRaises(ValueError):validate_annotation(a,(500,500))
-        for change in ('missing','absent_points','unknown_side','bad_type'):
+        for change in ('missing','absent_points','bad_type'):
             a=annotation('0'*20)
             if change=='missing':a['lines']['head_line']['points'].pop()
             if change=='absent_points':a['lines']['head_line']['status']='absent'
-            if change=='unknown_side':a['handedness']='unknown'
             if change=='bad_type':a['lines']['head_line']=7
             with self.assertRaises(ValueError):validate_annotation(a,(500,500))
     def test_subject_split_and_export(self):
@@ -126,6 +161,17 @@ class DataTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_train_with_unknown_side_metadata(self):
+        with tempfile.TemporaryDirectory() as t:
+            project=Path(t);rows=fixture(project,6)
+            for row in rows:
+                a=read_json(annotation_path(project,row['image_id']));a.update(handedness='unknown',mirrored='unknown')
+                write_json(annotation_path(project,row['image_id']),a)
+            result=train(project,project/'runs/train',epochs=1,batch_size=3)
+            self.assertIsNone(result['validation']['hand_accuracy'])
+            self.assertEqual(result['validation']['hand_samples'],0)
+            self.assertTrue(np.isfinite(result['validation']['reference_error_palm_width']))
+
     def test_train_and_pseudo_review_fallback(self):
         with tempfile.TemporaryDirectory() as t:
             project=Path(t)/'p';fixture(project);out=project/'runs/train';result=train(project,out,epochs=2,batch_size=6)
@@ -147,6 +193,9 @@ class WorkflowTests(unittest.TestCase):
         model.metadata={'positive_counts':dict.fromkeys(LINES,10),'validation':{'samples':10,'reference_error_palm_width':.01,'hand_accuracy':1,'lines':{k:{'auto_label_supported':True} for k in LINES}}}
         with patch.object(model,'predict',return_value=prediction):
             result=infer(model,np.zeros((500,500,3),np.uint8),'no');self.assertFalse(result['needs_review'])
+            model.metadata['validation']['hand_accuracy']=None
+            result=infer(model,np.zeros((500,500,3),np.uint8))
+            self.assertFalse(result['needs_review']);self.assertEqual(result['handedness'],'unknown')
             prediction['points'][0]=prediction['points'][1];self.assertTrue(infer(model,np.zeros((500,500,3),np.uint8),'no')['needs_review'])
 
 

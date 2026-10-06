@@ -1,8 +1,8 @@
 ## Pipeline keypoint mới (Heart / Head / Life / Fate)
 
-Mở **http://127.0.0.1:8501/keypoints** để kiểm duyệt 6 điểm mỗi đường, đo B-spline, nhập metadata, train CNN NumPy từ scratch và tạo pseudo-label. Không dùng PyTorch/scikit-learn. Hướng dẫn và giới hạn: [docs/KEYPOINT_PIPELINE.md](docs/KEYPOINT_PIPELINE.md).
+Bấm **Palmistry Live Camera** trên Desktop để mở app dán nhãn. Đặt 6 điểm mỗi đường, 2 điểm bề rộng rồi bấm **Duyệt & ảnh tiếp**; không cần điền bên tay/lật gương. Phần metadata và huấn luyện nằm trong mục mở rộng. Địa chỉ kiểm tra: http://127.0.0.1:8501/keypoints. Không dùng PyTorch/scikit-learn. Hướng dẫn và giới hạn: [docs/KEYPOINT_PIPELINE.md](docs/KEYPOINT_PIPELINE.md).
 
-Project `palm_keypoints_main` có 400 ảnh chờ duyệt và 11.600 nguồn còn lại. Cần nhãn keypoint thật trước khi train; checkpoint segmentation cũ không dùng trực tiếp cho mô hình mới. Các phần mask/camera bên dưới là legacy và được giữ để đối chiếu.
+Project `palm_keypoints_main` có chỉ tiêu 100 ảnh; các ảnh vượt chỉ tiêu được giữ trong danh sách nguồn còn lại. Cần nhãn keypoint thật trước khi train; checkpoint segmentation cũ không dùng trực tiếp cho mô hình mới. Các phần mask/camera bên dưới là legacy và được giữ để đối chiếu.
 
 # Palm-line segmentation · reproducible computer-vision prototype
 
@@ -185,11 +185,11 @@ testing pipeline mechanics, but they are not human ground truth and should
 not be treated as evidence of real-world accuracy. The train phase requires
 the NumPy model from the core environment; no optional ML environment is required.
 
-### Human review 400 mask đầu và bootstrap pseudo-label
+### Human review 100 mask đầu và bootstrap pseudo-label
 
 Trên giao diện, chọn **Chuẩn bị queue review** sau khi nhập dataset. Thư mục ảnh
 được kiểm kê và lọc trùng SHA-256, không chép lại TIFF và không áp giới hạn 20.000
-entry của archive cho tổng dataset. Chỉ 400 ảnh được tạo crop, mask và overlay;
+entry của archive cho tổng dataset. Mặc định 100 ảnh được tạo crop, mask và overlay;
 các ảnh còn lại được lập chỉ mục để xử lý sau khi duyệt. Mọi mask mới là `pending`,
 chưa chia train/val/test. Trang duyệt có 40 dòng/trang và lưu trạng thái từng dòng.
 
@@ -203,7 +203,7 @@ pseudo-label. Xem [các lỗi, cách sửa và fallback](docs/REVIEW_PIPELINE_FI
 
 Để dùng kiểm duyệt thủ công làm seed đáng tin cậy, chạy phase tiền xử lý và tạo queue:
 
-    .\.venv\Scripts\python.exe pipeline.py --input_zip C:\data\palms.zip --run_dir artifacts\pipeline_review_001 --prepare_review --review_count 400 --out_size 512 --input_size 256
+    .\.venv\Scripts\python.exe pipeline.py --input_zip C:\data\palms.zip --run_dir artifacts\pipeline_review_001 --prepare_review --review_count 100 --out_size 512 --input_size 256
 
 Mở artifacts/pipeline_review_001/review/queue.html để xem ảnh và overlay. Nếu cần,
 sửa file mask PNG bằng công cụ annotation, giữ class IDs 0..6 (simian = 6) và đúng kích thước ảnh.
@@ -402,7 +402,7 @@ an internet connection for pip are required.
 
 Inside the app, choose a ZIP or RAR in the Nhập ảnh từ ZIP hoặc RAR card and press Nhận ZIP/RAR và nhập ảnh. Large archives are uploaded in 16 MB chunks with retry and progress reporting, then imported in a background job so a 4GB RAR does not hit a single-request timeout. Real RAR archives are extracted in one batch backend process instead of spawning a process per image, and the UI reports extraction and image-validation progress. Valid image files are decoded and written to dataset/images; each import creates a report under dataset/imports. The default limits are 8 GB compressed, 32 GB expanded, 100 MB per member and 20,000 members. Set PALM_MAX_ARCHIVE_BYTES, PALM_MAX_ARCHIVE_EXPANDED_BYTES, PALM_MAX_ARCHIVE_MEMBER_BYTES, PALM_MAX_ARCHIVE_MEMBERS, PALM_ARCHIVE_UPLOAD_CHUNK_BYTES, PALM_ARCHIVE_UPLOAD_DIR and PALM_DATASET_DIR to tune them for available disk and bandwidth. Non-image, corrupt, directory, unsafe and over-sized entries are reported as skipped. Password-protected and multi-volume RAR archives are rejected with an actionable message; decrypt or combine them first. No archive is imported automatically at startup.
 
-The same app now exposes the end-to-end pipeline in the **Pipeline dataset → review → train** card. Enter a run name, choose the number of masks to review (400 by default), and press **Chuẩn bị queue review**. When preprocessing finishes, **Mở trang duyệt mask** opens the review table; each row can be marked pending, approved or rejected and saved from the browser. Set the pseudo-label confidence and output name, then press **Bootstrap + train model cuối**. Jobs run in the background and their logs/results remain under artifacts/<run-name>; no pipeline CLI command is required for normal use.
+The same app now exposes the end-to-end pipeline in the **Pipeline dataset → review → train** card. Enter a run name, choose the number of masks to review (100 by default), and press **Chuẩn bị queue review**. When preprocessing finishes, **Mở trang duyệt mask** opens the review table; each row can be marked pending, approved or rejected and saved from the browser. Set the pseudo-label confidence and output name, then press **Bootstrap + train model cuối**. Jobs run in the background and their logs/results remain under artifacts/<run-name>; no pipeline CLI command is required for normal use.
 
 ## Bốn đường và phép đo v2
 

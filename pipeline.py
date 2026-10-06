@@ -677,7 +677,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no_exact_dedupe", action="store_true")
     parser.add_argument("--preprocess_only", action="store_true")
     parser.add_argument("--prepare_review", action="store_true", help="Tạo queue HTML/CSV để duyệt mask")
-    parser.add_argument("--review_count", type=int, default=400)
+    parser.add_argument("--review_count", type=int, default=100)
     parser.add_argument("--model_size", choices=["tiny", "small", "medium"], default="small")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=2)

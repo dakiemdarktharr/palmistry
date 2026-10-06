@@ -1987,13 +1987,13 @@ HTML_TEMPLATE = """
 
                 <div class="card">
                     <h2>Pipeline mask cũ (legacy)</h2><p><a href="/keypoints">Dùng pipeline keypoint Heart / Head / Life / Fate mới</a></p>
-                    <p class="small">Sau khi nhập ZIP/RAR, hệ thống lọc ảnh trùng và chuẩn bị 400 mask chờ duyệt. Các ảnh còn lại được xử lý sau khi có seed đã duyệt. Mở trang review để đánh dấu approved/rejected, rồi bootstrap pseudo-label và train model cuối.</p>
+                    <p class="small">Sau khi nhập ZIP/RAR, hệ thống lọc ảnh trùng và chuẩn bị 100 mask chờ duyệt. Các ảnh còn lại được xử lý sau khi có seed đã duyệt. Mở trang review để đánh dấu approved/rejected, rồi bootstrap pseudo-label và train model cuối.</p>
                     <label class="small">Tên run:
                         <input id="pipelineRunName" value="pipeline_ui_001" maxlength="64">
                     </label>
                     <br>
                     <label class="small">Số mask cần duyệt:
-                        <input id="pipelineReviewCount" type="number" min="1" max="3000" value="400">
+                        <input id="pipelineReviewCount" type="number" min="1" max="3000" value="100">
                     </label>
                     <br>
                     <button class="purple" id="prepareReview">Chuẩn bị queue review</button>
@@ -2533,7 +2533,7 @@ def api_pipeline_status():
 def api_pipeline_prepare_review():
     payload = request.get_json(silent=True) or {}
     try:
-        count = int(payload.get("review_count", 400))
+        count = int(payload.get("review_count", 100))
         if not 1 <= count <= PIPELINE_MAX_REVIEW_COUNT:
             raise ValueError("Số mask review phải trong khoảng 1..3000.")
         if dataset_image_count() <= 0:

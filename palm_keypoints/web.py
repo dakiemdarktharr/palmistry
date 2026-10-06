@@ -121,7 +121,7 @@ def register_keypoint_ui(app,project_dir,csrf,nonce,legacy_busy=lambda:False):
     def kp_create():
         b=body();run=safe_path(root/'artifacts',name(b['run']));n=name(b['name']);out=safe_path(base,n)
         if out.exists():raise ValueError('Project đã tồn tại; chọn tên khác.')
-        count=int(b.get('count',400))
+        count=int(b.get('count',100))
         if not 1<=count<=400:raise ValueError('Queue thủ công từ 1 đến 400 ảnh.')
         if not (run/'review/review.csv').is_file():raise ValueError('Queue nguồn không tồn tại.')
         job_id=begin('create',['from-review','--run',str(run),'--out',str(out),'--count',str(count)],out,n)

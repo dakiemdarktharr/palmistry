@@ -17,7 +17,8 @@ def evaluate(model,rows,project):
         rgb=read_rgb(safe_path(project,row['image_path']));h,w=rgb.shape[:2];a=row['annotation']
         pred=model.predict(rgb);width=width_from_points(a['palm_width_points'],(w,h))
         widths.append(float(np.linalg.norm((pred['points'][24:]-a['palm_width_points'])*[w-1,h-1],axis=1).mean()/width))
-        truth=(a['handedness']=='right')!=(a['mirrored']=='yes');hands.append((pred['apparent_right_score']>=.5)==truth)
+        if a['handedness']!='unknown' and a['mirrored']!='unknown':
+            truth=(a['handedness']=='right')!=(a['mirrored']=='yes');hands.append((pred['apparent_right_score']>=.5)==truth)
         for i,name in enumerate(LINES):
             s=stats[name];positive=a['lines'][name]['status']=='present';detected=pred['presence'][i]>=.5
             s['present' if positive else 'absent']+=1;s['tp']+=int(positive and detected);s['fp']+=int(not positive and detected);s['fn']+=int(positive and not detected)
@@ -29,7 +30,7 @@ def evaluate(model,rows,project):
         # A small validation set is insufficient evidence, even when loss is low.
         s['auto_label_supported']=bool(s['present']>=3 and s['absent']>=3 and s['precision']>=.95 and s['recall']>=.9 and s['pck_at_005']>=.9)
     return {'samples':len(rows),'lines':stats,'reference_error_palm_width':float(np.mean(widths)),
-            'hand_accuracy':float(np.mean(hands)),'confidence_semantics':'MC-dropout ranking, not calibrated probability'}
+            'hand_samples':len(hands),'hand_accuracy':float(np.mean(hands)) if hands else None,'confidence_semantics':'MC-dropout ranking, not calibrated probability'}
 
 
 def train(project,out,epochs=60,batch_size=8,seed=42,lr=.001,patience=12):
@@ -89,9 +90,8 @@ def infer(model,rgb,mirrored='unknown'):
     if confidence[24:].min()<.90:reasons.append('uncertain_palm_reference')
     if validation.get('reference_error_palm_width',1)>.05:reasons.append('reference_validation_insufficient')
     right=float(pred['apparent_right_score']);side='unknown'
-    if mirrored!='unknown' and max(right,1-right)>=.90 and validation.get('hand_accuracy',0)>=.95 and validation.get('samples',0)>=6:
+    if mirrored!='unknown' and max(right,1-right)>=.90 and (validation.get('hand_accuracy') or 0)>=.95 and validation.get('hand_samples',0)>=6:
         side='right' if ((right>=.5)!=(mirrored=='yes')) else 'left'
-    else:reasons.append('handedness_requires_review')
     lines={}
     for i,name in enumerate(LINES):
         probability=float(pred['presence'][i]);supported=line_validation.get(name,{}).get('auto_label_supported',False)

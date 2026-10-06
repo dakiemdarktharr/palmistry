@@ -48,7 +48,6 @@ def validate_annotation(annotation,image_size,approve=False):
     if ref.shape!=(0,) and (ref.ndim!=2 or ref.shape[1]!=2 or len(ref)>2 or not np.isfinite(ref).all() or np.any((ref<0)|(ref>1))):raise ValueError('Điểm bề rộng không hợp lệ.')
     if approve or a['status']=='approved':
         width=width_from_points(a.get('palm_width_points'),image_size)
-        if a['handedness']=='unknown' or a['mirrored']=='unknown':raise ValueError('Xác nhận bên tay và trạng thái lật gương trước khi approved.')
         for name in LINES:
             line=a['lines'][name]
             if line['status']=='unreviewed':raise ValueError(f'Chưa kiểm tra {name}; không coi thiếu nhãn là absent.')
@@ -60,7 +59,7 @@ def validate_annotation(annotation,image_size,approve=False):
     return a
 
 
-def create_from_review(run,project,count=400):
+def create_from_review(run,project,count=100):
     if not 1<=count<=400:raise ValueError('Queue thủ công từ 1 đến 400 ảnh.')
     run,project=Path(run).resolve(),Path(project).resolve()
     if project.exists():raise FileExistsError('Project đã tồn tại; chọn tên mới.')
@@ -105,6 +104,31 @@ def load_project(project):
     return data
 
 
+def limit_review_queue(project,count=100):
+    """Reduce a local queue with a recovery snapshot; keep every reviewed image."""
+    if not 1<=count<=400:raise ValueError('Review count must be 1..400.')
+    project=Path(project);doc=load_project(project)
+    if len(doc['images'])<=count:return {'ok':True,'images':len(doc['images']),'deferred':0}
+    reviewed=[];pending=[]
+    for item in doc['images']:
+        a=read_json(annotation_path(project,item['image_id']))
+        (pending if a['status']=='pending' else reviewed).append(item)
+    if len(reviewed)>count:raise ValueError('Target is smaller than the number of reviewed images; no changes made.')
+    chosen={r['image_id'] for r in (reviewed+pending)[:count]}
+    deferred=[r for r in doc['images'] if r['image_id'] not in chosen]
+    remaining=read_json(project/'remaining_sources.json')
+    import uuid
+    backup=project/'backups'/('queue_'+uuid.uuid4().hex+'.json')
+    write_json(backup,{'project':doc,'remaining_sources':remaining})
+    remaining['paths']=list(dict.fromkeys(remaining.get('paths',[])+[r['source_path'] for r in deferred]))
+    # Write remaining first: interruption can leave duplicate references, never lost sources.
+    write_json(project/'remaining_sources.json',remaining)
+    doc['images']=[r for r in doc['images'] if r['image_id'] in chosen]
+    doc['remaining_count']=len(remaining['paths']);doc['review_target']=count
+    write_json(project/'project.json',doc)
+    return {'ok':True,'images':len(doc['images']),'deferred':len(deferred),'backup':str(backup)}
+
+
 def audited_rows(project,seed=42):
     project=Path(project);rows=[]
     if load_project(project).get('tutorial_only'):raise ValueError('Đây là mẫu hướng dẫn, không dùng để train hoặc export tập huấn luyện.')
@@ -145,7 +169,7 @@ def export_yolo(project,out,seed=42):
     return {'ok':True,'count':len(rows),'out':str(out)}
 
 
-def create_from_pseudo(report,project,count=400,offset=0):
+def create_from_pseudo(report,project,count=100,offset=0):
     """Materialize proposals into an editable, pending queue; never auto-approve."""
     report=Path(report).resolve();project=Path(project).resolve()
     if project.exists():raise FileExistsError('Dùng tên project review mới.')
